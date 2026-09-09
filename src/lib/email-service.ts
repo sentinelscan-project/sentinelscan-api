@@ -106,8 +106,9 @@ export class ResendEmailService implements EmailService {
 }
 
 export function createEmailService(config: Env = defaultEnv): EmailService {
-  if (config.EMAIL_PROVIDER === "resend" && config.EMAIL_API_KEY) {
-    return new ResendEmailService(config.EMAIL_API_KEY, config.EMAIL_FROM);
+  const resendApiKey = config.RESEND_API_KEY || config.EMAIL_API_KEY;
+  if ((config.EMAIL_PROVIDER === "resend" || Boolean(config.RESEND_API_KEY)) && resendApiKey) {
+    return new ResendEmailService(resendApiKey, config.EMAIL_FROM);
   }
 
   return new DevelopmentEmailService();

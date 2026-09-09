@@ -3,6 +3,16 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+const optionalNonEmptyString = z.preprocess(
+  (val) => (typeof val === "string" && val.trim() === "" ? undefined : val),
+  z.string().min(1).optional(),
+);
+
+const optionalUrl = z.preprocess(
+  (val) => (typeof val === "string" && val.trim() === "" ? undefined : val),
+  z.string().url("GOOGLE_CALLBACK_URL must be a valid URL").optional(),
+);
+
 /**
  * Google OAuth/OIDC is optional: the API boots and serves email/password
  * authentication without it. The three variables below must be supplied
@@ -10,9 +20,9 @@ dotenv.config();
  */
 const googleOAuthSchema = z
   .object({
-    GOOGLE_CLIENT_ID: z.string().min(1).optional(),
-    GOOGLE_CLIENT_SECRET: z.string().min(1).optional(),
-    GOOGLE_CALLBACK_URL: z.string().url("GOOGLE_CALLBACK_URL must be a valid URL").optional(),
+    GOOGLE_CLIENT_ID: optionalNonEmptyString,
+    GOOGLE_CLIENT_SECRET: optionalNonEmptyString,
+    GOOGLE_CALLBACK_URL: optionalUrl,
   })
   .refine(
     (value) => {
@@ -39,11 +49,12 @@ const baseEnvSchema = z.object({
   WEB_APP_URL: z.string().url("WEB_APP_URL must be a valid URL").default("http://localhost:3000"),
   EMAIL_PROVIDER: z.enum(["development", "resend", "smtp"]).default("development"),
   EMAIL_FROM: z.string().default("SentinelScan <noreply@sentinelscan.io>"),
-  EMAIL_API_KEY: z.string().min(1).optional(),
-  SMTP_HOST: z.string().min(1).optional(),
-  SMTP_PORT: z.coerce.number().optional(),
-  SMTP_USER: z.string().min(1).optional(),
-  SMTP_PASS: z.string().min(1).optional(),
+  EMAIL_API_KEY: optionalNonEmptyString,
+  RESEND_API_KEY: optionalNonEmptyString,
+  SMTP_HOST: optionalNonEmptyString,
+  SMTP_PORT: z.preprocess((val) => (val === "" ? undefined : val), z.coerce.number().optional()),
+  SMTP_USER: optionalNonEmptyString,
+  SMTP_PASS: optionalNonEmptyString,
 });
 
 const envSchema = baseEnvSchema.and(googleOAuthSchema);
