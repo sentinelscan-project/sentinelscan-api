@@ -22,6 +22,8 @@ declare module "fastify" {
     tokenRepository: import("../repositories/token.repository.js").VerificationTokenRepository;
     /** Email delivery abstraction. */
     emailService: import("../lib/email-service.js").EmailService;
+    /** The target persistence boundary the app was built with. */
+    targetRepository: import("../repositories/target.repository.js").TargetRepository;
   }
 
   interface FastifyRequest {

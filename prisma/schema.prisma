@@ -14,8 +14,8 @@ generator client {
 /// local account has been linked to a Google identity. Google-only users
 /// therefore have a null `passwordHash`.
 ///
-/// Future stages will hang user-owned resources (targets, scans, findings, AI
-/// analyses, reports) off this model via relations; none of them exist yet.
+/// Stage 2 attaches the first user-owned resource, `Target`, via `targets`.
+/// Later stages will hang scans, findings, AI analyses and reports off it too.
 model User {
   id                 String                   @id @default(uuid())
   email              String                   @unique
@@ -27,6 +27,7 @@ model User {
   createdAt          DateTime                 @default(now())
   updatedAt          DateTime                 @updatedAt
   verificationTokens EmailVerificationToken[]
+  targets            Target[]
 
   @@map("users")
 }
@@ -43,5 +44,44 @@ model EmailVerificationToken {
 
   @@index([userId])
   @@map("email_verification_tokens")
+}
+
+/// Whether a target is currently considered in scope for assessment work.
+/// Lowercase values so the Prisma client's JSON representation matches the
+/// API's wire format with no translation layer in between.
+enum TargetStatus {
+  active
+  inactive
+}
+
+/// An authorized web application registered by a user for future security
+/// assessment.
+///
+/// Stage 2 is registration and management only: nothing in this codebase
+/// makes a network request to `url`. Later stages (discovery, the
+/// SentinelScan scanner, OWASP ZAP) will read `Target` rows as their starting
+/// point but are not implemented yet.
+model Target {
+  id          String       @id @default(uuid())
+  ownerId     String
+  name        String
+  /// Absolute http(s) URL, normalized by the API (see `lib/url.ts`) before
+  /// it ever reaches this column.
+  url         String
+  description String?
+  status      TargetStatus @default(active)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  owner User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  // A lookup index for "list my targets", and a uniqueness guarantee that
+  // stops one user from registering the same URL twice. Two different users
+  // may register the same URL — e.g. a shared staging environment both are
+  // separately authorized to test — so this is scoped to (ownerId, url)
+  // rather than a bare unique constraint on `url`.
+  @@unique([ownerId, url])
+  @@index([ownerId])
+  @@map("targets")
 }
 

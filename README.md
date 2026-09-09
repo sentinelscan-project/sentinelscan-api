@@ -1,9 +1,9 @@
 # SentinelScan API (`sentinelscan-api`)
 
 ## Overview
-`sentinelscan-api` is the backend API service for **SentinelScan**. Built with Fastify and TypeScript, it provides the core API foundation, environment configuration validation with Zod, PostgreSQL persistence using Prisma, identity and authentication, centralized logging and error handling, and container packaging.
+`sentinelscan-api` is the backend API service for **SentinelScan**. Built with Fastify and TypeScript, it provides the core API foundation, environment configuration validation with Zod, PostgreSQL persistence using Prisma, identity and authentication, authorized target management, centralized logging and error handling, and container packaging.
 
-> **Stage 1 Notice**: This repository currently implements the backend foundation (Stage 0) plus identity and authentication (Stage 1). Domain features — target management, endpoint discovery, the SentinelScan scanner engine, OWASP ZAP integration, finding normalization and correlation, AI security analysis, and reporting — are deliberately not implemented yet. The `User` model is the only domain model; later stages will attach targets, scans, findings, analyses and reports to it.
+> **Stage 2 Notice**: This repository currently implements the backend foundation (Stage 0), identity and authentication (Stage 1), and target registration/management (Stage 2). Domain features beyond that — endpoint discovery, the SentinelScan scanner engine, OWASP ZAP integration, finding normalization and correlation, AI security analysis, and reporting — are deliberately not implemented yet. Registering a target does **not** trigger any network request, DNS resolution, crawl, or scan; a `Target` row is purely a record of an authorized assessment subject until later stages act on it. `User` and `Target` are the only domain models so far; later stages will attach scans, findings, analyses and reports to `Target`.
 
 ---
 
@@ -28,7 +28,7 @@
 sentinelscan-api/
 ├── prisma/
 │   ├── migrations/           # Versioned SQL migrations
-│   └── schema.prisma         # Datasource, generator and the User model
+│   └── schema.prisma         # Datasource, generator, User and Target models
 ├── src/
 │   ├── app.ts                # Fastify app factory with middleware & error handling
 │   ├── config.ts             # Zod environment validation & startup check
@@ -36,31 +36,42 @@ sentinelscan-api/
 │   ├── db/
 │   │   └── prisma.ts         # Lazy Prisma client singleton
 │   ├── lib/
+│   │   ├── email-service.ts  # Verification email delivery (development / Resend)
 │   │   ├── email.ts          # Email normalization
 │   │   ├── errors.ts         # AppError hierarchy with HTTP status codes
 │   │   ├── password.ts       # bcrypt hashing / verification
 │   │   ├── prisma-errors.ts  # Unique-constraint detection
+│   │   ├── url.ts            # Target URL validation & normalization
 │   │   └── validation.ts     # Zod → 400 ValidationError bridge
 │   ├── modules/
-│   │   └── auth/
-│   │       ├── auth.routes.ts    # /auth/register, /login, /me, /logout
-│   │       ├── auth.schemas.ts   # Zod request schemas & password policy
-│   │       ├── auth.service.ts   # Registration, login, Google account resolution
-│   │       └── google.routes.ts  # /auth/google, /auth/google/callback
+│   │   ├── auth/
+│   │   │   ├── auth.routes.ts    # /auth/register, /login, /verify-email, /me, /logout, ...
+│   │   │   ├── auth.schemas.ts   # Zod request schemas & password policy
+│   │   │   ├── auth.service.ts   # Registration, login, verification, Google account resolution
+│   │   │   └── google.routes.ts  # /auth/google, /auth/google/callback
+│   │   └── targets/
+│   │       ├── target.routes.ts  # /targets CRUD, all requiring authentication
+│   │       ├── target.schemas.ts # Zod request schemas & URL normalization wiring
+│   │       └── target.service.ts # Ownership-enforced create/list/get/update/delete
 │   ├── plugins/
 │   │   └── authentication.ts # JWT + cookie session, `authenticate` preHandler
 │   ├── repositories/
-│   │   ├── user.repository.ts        # UserRepository interface & PublicUser
-│   │   └── prisma-user.repository.ts # Prisma implementation
+│   │   ├── user.repository.ts          # UserRepository interface & PublicUser
+│   │   ├── prisma-user.repository.ts   # Prisma implementation
+│   │   ├── token.repository.ts         # Email verification token repository
+│   │   ├── target.repository.ts        # TargetRepository interface & PublicTarget
+│   │   └── prisma-target.repository.ts # Prisma implementation (ownership-scoped queries)
 │   ├── routes/
 │   │   └── health.ts         # GET /health endpoint
 │   └── types/
 │       └── fastify.d.ts      # Fastify/JWT type augmentation
 ├── tests/
 │   ├── helpers/
-│   │   └── in-memory-user.repository.ts # Database-free UserRepository for tests
-│   ├── auth.test.ts          # Registration, login, session, logout tests
+│   │   ├── in-memory-user.repository.ts   # Database-free User/token/email test doubles
+│   │   └── in-memory-target.repository.ts # Database-free TargetRepository for tests
+│   ├── auth.test.ts          # Registration, verification, login, session, logout tests
 │   ├── google-auth.test.ts   # Google identity & unconfigured-provider tests
+│   ├── targets.test.ts       # Target CRUD, ownership isolation, validation tests
 │   └── health.test.ts        # Vitest integration test
 ├── .dockerignore
 ├── .env.example
@@ -172,7 +183,7 @@ The three `GOOGLE_*` variables must be supplied together or omitted together; a 
 
 ## Data Model
 
-Stage 1 introduces a single model, `User` (table `users`):
+### `User` (table `users`)
 
 | Column | Type | Notes |
 | :--- | :--- | :--- |
@@ -181,14 +192,33 @@ Stage 1 introduces a single model, `User` (table `users`):
 | `name` | `String` | Display name |
 | `passwordHash` | `String?` | bcrypt hash; `null` for Google-only accounts |
 | `googleId` | `String?` | Unique Google `sub` claim; `null` until a Google identity is linked |
-| `emailVerified` | `Boolean` | `true` once Google asserts a verified email |
+| `emailVerified` | `Boolean` | `true` once the account's email address has been confirmed |
 | `lastLoginAt` | `DateTime?` | Updated on every successful sign-in |
 | `createdAt` | `DateTime` | Account creation timestamp |
 | `updatedAt` | `DateTime` | Auto-maintained update timestamp |
 
-Nullable `passwordHash` is what lets an email/password user and a Google user share one model. Later stages will hang `Target → Scan → Finding → AiAnalysis → Report` off `User`; none of those models exist yet.
+Nullable `passwordHash` is what lets an email/password user and a Google user share one model.
 
-Persistence is reached through the `UserRepository` interface rather than Prisma directly, so route handlers stay database-agnostic and the test suite can run against an in-memory implementation with no PostgreSQL instance.
+### `Target` (table `targets`)
+
+An authorized web application a user has registered for future security assessment. Stage 2 is registration and management only — creating or updating a `Target` never makes a network request to its `url`, resolves DNS, crawls it, or invokes any scanner.
+
+| Column | Type | Notes |
+| :--- | :--- | :--- |
+| `id` | `String` (uuid) | Primary key |
+| `ownerId` | `String` | Foreign key to `User.id`, `onDelete: Cascade`; always derived from the authenticated session, never from client input |
+| `name` | `String` | 1–120 characters |
+| `url` | `String` | Absolute `http(s)` URL, normalized on write (see [Target validation](#target-validation)) |
+| `description` | `String?` | Up to 1000 characters |
+| `status` | `TargetStatus` | `"active"` (default) or `"inactive"` |
+| `createdAt` | `DateTime` | Registration timestamp |
+| `updatedAt` | `DateTime` | Auto-maintained update timestamp |
+
+Indexed on `ownerId` for the "list my targets" query, with a unique constraint on `(ownerId, url)`: one user cannot register the same URL twice, but two different users can each register the same URL — e.g. a shared staging environment both are separately authorized to test.
+
+Later stages will hang `Scan → Finding → AiAnalysis → Report` off `Target`; none of those models exist yet.
+
+Persistence for both models is reached through a repository interface (`UserRepository`, `TargetRepository`) rather than Prisma directly, so route handlers stay database-agnostic and the test suite can run against an in-memory implementation with no PostgreSQL instance.
 
 ---
 
@@ -203,7 +233,7 @@ Sessions are **stateless JWTs delivered in an HttpOnly cookie**.
 - An `Authorization: Bearer <token>` header is also accepted, so non-browser clients (CI, future CLI tooling) can authenticate without a cookie jar. The header takes precedence when both are present.
 - Because CORS must allow credentialed requests, the allowed origin is the explicit `WEB_APP_URL` rather than a wildcard.
 
-This was chosen over server-side sessions because it needs no Redis or session table — no extra infrastructure — while still keeping the token out of JavaScript's reach. Every authenticated request re-reads the user from the database, so a deleted or changed account stops being usable before its token expires; that lookup is also where per-user authorization will hook in once targets and scans exist.
+This was chosen over server-side sessions because it needs no Redis or session table — no extra infrastructure — while still keeping the token out of JavaScript's reach. Every authenticated request re-reads the user from the database, so a deleted or changed account stops being usable before its token expires.
 
 ### Protecting a route
 
@@ -216,7 +246,13 @@ fastify.get("/targets", { preHandler: [fastify.authenticate] }, async (request, 
 });
 ```
 
-Authentication (who you are) is deliberately kept separate from authorization (what you may touch). No roles or RBAC exist yet.
+Or, for a whole route group like `/targets` where every route needs it, once per plugin:
+
+```ts
+fastify.addHook("preHandler", fastify.authenticate);
+```
+
+Authentication (who you are) is deliberately kept separate from authorization (what you may touch). There is still no role-based access control — `Target` ownership is enforced by scoping every query to `request.currentUser.id`, not by a permissions/roles system.
 
 ---
 
@@ -333,6 +369,74 @@ Every endpoint that returns a user returns exactly this shape:
 ```
 
 Callers learn *whether* a credential exists, never what it is.
+
+### Targets
+
+Every `/targets` route requires authentication (the same session cookie / bearer token as everything else) and is scoped entirely to `request.currentUser.id`: the owner is always derived from the session, never accepted from the request body, and a target belonging to another user is treated identically to a target that does not exist. None of these endpoints make a network request to the target's `url` — no crawling, scanning, or DNS resolution happens in Stage 2.
+
+#### `POST /targets`
+
+```json
+{ "name": "Acme Staging", "url": "https://staging.acme.example.com/app", "description": "Pre-production, authorized for testing." }
+```
+
+- `201` — `{ "target": { ... } }`
+- `400` `VALIDATION_ERROR` — missing/blank name, or `url` is not an absolute `http://`/`https://` address (a `javascript:`, `file:`, `data:`, relative, bare-hostname, or credentialed URL is rejected, not "handled")
+- `409` `TARGET_ALREADY_EXISTS` — this user has already registered this exact (normalized) URL
+
+`status` always starts `"active"`; it cannot be set on creation, only via `PATCH`.
+
+#### `GET /targets`
+
+- `200` — `{ "targets": [ { ... }, ... ] }`, newest first, containing only targets owned by the caller
+
+#### `GET /targets/:id`
+
+- `200` — `{ "target": { ... } }`
+- `400` `VALIDATION_ERROR` — `:id` is not a well-formed UUID
+- `404` `TARGET_NOT_FOUND` — no such target, *or* it belongs to a different user
+
+#### `PATCH /targets/:id`
+
+Any subset of `name`, `url`, `description`, `status`. Omitted fields are left unchanged; `description` explicitly set to `null` clears it (as opposed to omitting it, which leaves it as-is).
+
+```json
+{ "status": "inactive" }
+```
+
+- `200` — `{ "target": { ... } }`
+- `400` `VALIDATION_ERROR` — an included field fails its own rule (same URL/name rules as creation; `status` must be `"active"` or `"inactive"`)
+- `404` `TARGET_NOT_FOUND` — no such target, *or* it belongs to a different user
+- `409` `TARGET_ALREADY_EXISTS` — the new `url` collides with another of this user's targets
+
+#### `DELETE /targets/:id`
+
+- `204` — no body
+- `400` `VALIDATION_ERROR` — `:id` is not a well-formed UUID
+- `404` `TARGET_NOT_FOUND` — no such target, *or* it belongs to a different user
+
+#### Safe target representation
+
+```json
+{
+  "id": "6f1e...",
+  "name": "Acme Staging",
+  "url": "https://staging.acme.example.com/app",
+  "description": "Pre-production, authorized for testing.",
+  "status": "active",
+  "createdAt": "2026-09-10T09:00:00.000Z",
+  "updatedAt": "2026-09-10T09:00:00.000Z"
+}
+```
+
+`ownerId` is never included — the caller already knows every target returned here is theirs.
+
+#### Target validation
+
+- **Name**: required, trimmed, 1–120 characters.
+- **URL**: required, 1–2048 characters before normalization, must parse as an absolute `http:`/`https:` URL with no embedded username/password. Normalized via the WHATWG `URL` parser's own serialization (`new URL(input).href`) — lower-cased scheme/host, default ports dropped, root path filled in — so the same target registered twice in a different-but-equivalent form is recognized as a duplicate.
+- **Description**: optional, up to 1000 characters.
+- **Status**: `"active"` or `"inactive"` only.
 
 ### Error format
 

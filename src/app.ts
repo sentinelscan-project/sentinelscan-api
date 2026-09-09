@@ -12,6 +12,9 @@ import type { UserRepository } from "./repositories/user.repository.js";
 import { prismaVerificationTokenRepository } from "./repositories/token.repository.js";
 import type { VerificationTokenRepository } from "./repositories/token.repository.js";
 import { defaultEmailService, type EmailService } from "./lib/email-service.js";
+import { targetRoutes } from "./modules/targets/target.routes.js";
+import { prismaTargetRepository } from "./repositories/prisma-target.repository.js";
+import type { TargetRepository } from "./repositories/target.repository.js";
 
 export interface BuildAppOptions {
   /**
@@ -27,6 +30,10 @@ export interface BuildAppOptions {
    * Email delivery abstraction. Defaults to the configured provider (development, Resend, etc.).
    */
   emailService?: EmailService;
+  /**
+   * Persistence boundary for targets. Defaults to the Prisma-backed repository.
+   */
+  targetRepository?: TargetRepository;
 }
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
@@ -34,6 +41,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     userRepository = prismaUserRepository,
     tokenRepository = prismaVerificationTokenRepository,
     emailService = defaultEmailService,
+    targetRepository = prismaTargetRepository,
   } = options;
 
   const app = fastify({
@@ -49,6 +57,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
 
   app.decorate("tokenRepository", tokenRepository);
   app.decorate("emailService", emailService);
+  app.decorate("targetRepository", targetRepository);
 
   app.register(authentication, { userRepository });
 
@@ -111,6 +120,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   // Register routes
   app.register(healthRoutes);
   app.register(authRoutes, { prefix: "/auth" });
+  app.register(targetRoutes, { prefix: "/targets" });
 
   return app;
 }
