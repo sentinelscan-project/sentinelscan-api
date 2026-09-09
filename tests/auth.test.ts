@@ -11,6 +11,8 @@ import {
   type InMemoryVerificationTokenRepository,
 } from "./helpers/in-memory-user.repository.js";
 
+import { sessionCookieOptions } from "../src/plugins/authentication.js";
+
 const AUTH_COOKIE = "sentinelscan_token";
 
 const validRegistration = {
@@ -521,5 +523,13 @@ describe("POST /auth/logout", () => {
     });
 
     expect(response.statusCode).toBe(401);
+  });
+
+  it("configures session cookie with httpOnly, path, and appropriate sameSite/secure attributes", () => {
+    expect(sessionCookieOptions.httpOnly).toBe(true);
+    expect(sessionCookieOptions.path).toBe("/");
+    // In test environment (NODE_ENV !== "production"), sameSite is "lax" and secure is false
+    expect(sessionCookieOptions.sameSite).toBe("lax");
+    expect(sessionCookieOptions.secure).toBe(false);
   });
 });

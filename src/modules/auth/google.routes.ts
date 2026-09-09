@@ -4,6 +4,7 @@ import { OAuth2Client } from "google-auth-library";
 import { env, isGoogleOAuthConfigured } from "../../config.js";
 import { ServiceUnavailableError, UnauthorizedError } from "../../lib/errors.js";
 import { toPublicUser } from "../../repositories/user.repository.js";
+import { sessionCookieOptions } from "../../plugins/authentication.js";
 import { authenticateWithGoogle, type GoogleIdentity } from "./auth.service.js";
 
 /**
@@ -116,6 +117,17 @@ export const googleAuthRoutes: FastifyPluginAsync = async (fastify: FastifyInsta
 
     const user = await authenticateWithGoogle(fastify.userRepository, identity);
     fastify.issueSession(reply, user);
+
+    fastify.log.info(
+      {
+        userId: user.id,
+        cookieName: env.AUTH_COOKIE_NAME,
+        sameSite: sessionCookieOptions.sameSite,
+        secure: sessionCookieOptions.secure,
+        redirectUrl: env.WEB_APP_URL,
+      },
+      "Issued authentication session for Google OAuth user and set cookie; redirecting to web app",
+    );
 
     // Browsers land here from Google, so hand the session back to the web app
     // rather than rendering JSON. `toPublicUser` keeps the shape aligned with

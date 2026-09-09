@@ -22,16 +22,22 @@ const isProduction = env.NODE_ENV === "production";
 /**
  * Cookie attributes for the session cookie.
  *
- * `httpOnly` keeps the token out of reach of client-side JavaScript (so an XSS
- * bug cannot exfiltrate a session), `secure` requires HTTPS outside local
- * development, and `sameSite: "lax"` blocks the cookie on cross-site
- * sub-requests while still allowing top-level navigations back from the Google
- * OAuth redirect.
+ * In production:
+ * - `httpOnly`: keeps the token out of reach of client-side JavaScript.
+ * - `secure`: required for SameSite=None in all modern browsers.
+ * - `sameSite`: "none" allows cross-site requests between the Vercel frontend
+ *   (https://sentinelscan-web.vercel.app) and the Render API
+ *   (https://sentinelscan-api.onrender.com).
+ * - `path`: "/" ensures the cookie is sent for all API paths.
+ *
+ * In local development / test:
+ * - `secure`: false (allows plain HTTP).
+ * - `sameSite`: "lax" (modern browsers reject SameSite=None over insecure HTTP).
  */
-const sessionCookieOptions = {
+export const sessionCookieOptions = {
   httpOnly: true,
   secure: isProduction,
-  sameSite: "lax",
+  sameSite: isProduction ? ("none" as const) : ("lax" as const),
   path: "/",
 } as const;
 
