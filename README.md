@@ -238,11 +238,39 @@ Creates a local email/password account.
 
 Password policy: 10–128 characters, with at least one lowercase letter, one uppercase letter and one digit.
 
-- `201` — `{ "user": { ... } }`
+- `201` — `{ "user": { ... }, "message": "Registration successful. Please check your email to verify your account." }`
 - `400` `VALIDATION_ERROR` — invalid body, email or password (with per-field `details`)
 - `409` `EMAIL_ALREADY_REGISTERED` — the email is already in use
 
-Registration does **not** start a session; call `POST /auth/login` afterwards.
+Registration does **not** start a session and sets `emailVerified: false`. A verification email containing a single-use token link (`/verify-email?token=<token>`) is dispatched.
+
+### `POST /auth/verify-email`
+
+Verifies an account using the token sent via email.
+
+```json
+{ "token": "a1b2c3d4e5..." }
+```
+
+- `200` — `{ "user": { ... }, "message": "Email verified successfully." }` plus session cookie
+- `400` `INVALID_TOKEN` — token not found
+- `400` `TOKEN_EXPIRED` — token has expired (lifetime: 24h)
+- `400` `TOKEN_ALREADY_USED` — token has already been redeemed
+
+Upon success, sets `emailVerified: true` and automatically issues an authenticated session cookie.
+
+### `POST /auth/resend-verification`
+
+Resends the verification email for an unverified account.
+
+```json
+{ "email": "analyst@example.com" }
+```
+
+- `200` — `{ "message": "If an unverified account with that email exists, a verification link has been sent." }`
+- `429` `RATE_LIMITED` — resend requested within the 60-second cooldown window
+
+Always returns a generic `200` response for unknown or already-verified emails to prevent email enumeration.
 
 ### `POST /auth/login`
 
@@ -250,11 +278,12 @@ Registration does **not** start a session; call `POST /auth/login` afterwards.
 { "email": "analyst@example.com", "password": "Str0ngPassphrase" }
 ```
 
-- `200` — `{ "user": { ... } }` plus a `Set-Cookie` carrying the session token
+- `200` — `{ "user": { ... } }` plus a `Set-Cookie` carrying the session token (for verified accounts)
 - `400` `VALIDATION_ERROR` — malformed body
 - `401` `INVALID_CREDENTIALS` — wrong password, unknown email, or a Google-only account
+- `403` `EMAIL_NOT_VERIFIED` — valid password, but email verification is pending
 
-The `401` response and its timing are identical in all three cases, so login never discloses whether an email is registered.
+The `401` response and its timing are identical for wrong passwords and unknown emails, so login never discloses whether an unregistered email exists. Only when the correct password is submitted for an unverified account does `403 EMAIL_NOT_VERIFIED` guide the user to verify.
 
 ### `GET /auth/me`
 

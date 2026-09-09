@@ -2,8 +2,18 @@ import type { FastifyInstance, FastifyPluginAsync } from "fastify";
 import { UnauthorizedError } from "../../lib/errors.js";
 import { parseOrThrow } from "../../lib/validation.js";
 import { toPublicUser } from "../../repositories/user.repository.js";
-import { loginBodySchema, registerBodySchema } from "./auth.schemas.js";
-import { loginUser, registerUser } from "./auth.service.js";
+import {
+  loginBodySchema,
+  registerBodySchema,
+  resendVerificationBodySchema,
+  verifyEmailBodySchema,
+} from "./auth.schemas.js";
+import {
+  loginUser,
+  registerUser,
+  resendVerificationEmail,
+  verifyEmail,
+} from "./auth.service.js";
 import { googleAuthRoutes } from "./google.routes.js";
 
 /**
@@ -15,8 +25,37 @@ import { googleAuthRoutes } from "./google.routes.js";
 export const authRoutes: FastifyPluginAsync = async (fastify: FastifyInstance) => {
   fastify.post("/register", async (request, reply) => {
     const body = parseOrThrow(registerBodySchema, request.body);
-    const user = await registerUser(fastify.userRepository, body);
-    return reply.status(201).send({ user: toPublicUser(user) });
+    const user = await registerUser(
+      fastify.userRepository,
+      fastify.tokenRepository,
+      fastify.emailService,
+      body,
+    );
+    return reply.status(201).send({
+      user: toPublicUser(user),
+      message: "Registration successful. Please check your email to verify your account.",
+    });
+  });
+
+  fastify.post("/verify-email", async (request, reply) => {
+    const body = parseOrThrow(verifyEmailBodySchema, request.body);
+    const user = await verifyEmail(fastify.userRepository, fastify.tokenRepository, body.token);
+    fastify.issueSession(reply, user);
+    return reply.status(200).send({
+      user: toPublicUser(user),
+      message: "Email verified successfully.",
+    });
+  });
+
+  fastify.post("/resend-verification", async (request, reply) => {
+    const body = parseOrThrow(resendVerificationBodySchema, request.body);
+    const result = await resendVerificationEmail(
+      fastify.userRepository,
+      fastify.tokenRepository,
+      fastify.emailService,
+      body.email,
+    );
+    return reply.status(200).send(result);
   });
 
   fastify.post("/login", async (request, reply) => {

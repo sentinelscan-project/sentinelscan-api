@@ -35,6 +35,7 @@ export interface UserRepository {
   create(input: CreateUserInput): Promise<UserRecord>;
   /** Attaches a Google identity to an existing local account. */
   linkGoogleAccount(id: string, googleId: string, emailVerified: boolean): Promise<UserRecord>;
+  setEmailVerified(id: string, emailVerified: boolean): Promise<UserRecord>;
   recordLogin(id: string, at: Date): Promise<UserRecord>;
 }
 

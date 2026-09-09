@@ -18,6 +18,10 @@ declare module "fastify" {
     clearSession: (reply: FastifyReply) => void;
     /** The user persistence boundary the app was built with. */
     userRepository: UserRepository;
+    /** The verification token persistence boundary. */
+    tokenRepository: import("../repositories/token.repository.js").VerificationTokenRepository;
+    /** Email delivery abstraction. */
+    emailService: import("../lib/email-service.js").EmailService;
   }
 
   interface FastifyRequest {

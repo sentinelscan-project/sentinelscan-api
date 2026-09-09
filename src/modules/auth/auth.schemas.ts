@@ -37,5 +37,15 @@ export const loginBodySchema = z.object({
   password: z.string().min(1, "Password is required"),
 });
 
+export const verifyEmailBodySchema = z.object({
+  token: z.string().trim().min(1, "Verification token is required"),
+});
+
+export const resendVerificationBodySchema = z.object({
+  email: emailSchema,
+});
+
 export type RegisterBody = z.infer<typeof registerBodySchema>;
 export type LoginBody = z.infer<typeof loginBodySchema>;
+export type VerifyEmailBody = z.infer<typeof verifyEmailBodySchema>;
+export type ResendVerificationBody = z.infer<typeof resendVerificationBodySchema>;

@@ -26,10 +26,24 @@ export class ValidationError extends AppError {
   }
 }
 
+export class BadRequestError extends AppError {
+  constructor(message = "Bad request", code = "BAD_REQUEST", details?: unknown) {
+    super(400, code, message, details);
+    this.name = "BadRequestError";
+  }
+}
+
 export class UnauthorizedError extends AppError {
   constructor(message = "Authentication required", code = "UNAUTHORIZED") {
     super(401, code, message);
     this.name = "UnauthorizedError";
+  }
+}
+
+export class ForbiddenError extends AppError {
+  constructor(message = "Access forbidden", code = "FORBIDDEN", details?: unknown) {
+    super(403, code, message, details);
+    this.name = "ForbiddenError";
   }
 }
 
@@ -40,9 +54,17 @@ export class ConflictError extends AppError {
   }
 }
 
+export class TooManyRequestsError extends AppError {
+  constructor(message = "Too many requests. Please try again later.", code = "RATE_LIMITED") {
+    super(429, code, message);
+    this.name = "TooManyRequestsError";
+  }
+}
+
 export class ServiceUnavailableError extends AppError {
   constructor(message: string, code = "SERVICE_UNAVAILABLE") {
     super(503, code, message);
     this.name = "ServiceUnavailableError";
   }
 }
+

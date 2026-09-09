@@ -3,7 +3,12 @@ import { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { isGoogleOAuthConfigured } from "../src/config.js";
 import { authenticateWithGoogle } from "../src/modules/auth/auth.service.js";
-import { createInMemoryUserRepository, type InMemoryUserRepository } from "./helpers/in-memory-user.repository.js";
+import {
+  createInMemoryUserRepository,
+  createInMemoryVerificationTokenRepository,
+  MockEmailService,
+  type InMemoryUserRepository,
+} from "./helpers/in-memory-user.repository.js";
 
 /**
  * These tests exercise the Google identity boundary without touching Google:
@@ -24,7 +29,11 @@ let users: InMemoryUserRepository;
 
 beforeAll(async () => {
   users = createInMemoryUserRepository();
-  app = buildApp({ userRepository: users });
+  app = buildApp({
+    userRepository: users,
+    tokenRepository: createInMemoryVerificationTokenRepository(),
+    emailService: new MockEmailService(),
+  });
   await app.ready();
 });
 
@@ -62,7 +71,7 @@ describe.skipIf(isGoogleOAuthConfigured())("Google OAuth routes without configur
 });
 
 describe("authenticateWithGoogle", () => {
-  it("provisions a passwordless account for a first-time Google user", async () => {
+  it("provisions a passwordless account for a first-time Google user with emailVerified=true", async () => {
     const user = await authenticateWithGoogle(users, identity);
 
     expect(user.email).toBe("analyst@sentinelscan.io");
@@ -80,11 +89,12 @@ describe("authenticateWithGoogle", () => {
     expect(users.rows.size).toBe(1);
   });
 
-  it("links an existing local account instead of creating a duplicate", async () => {
+  it("links an existing local account instead of creating a duplicate and marks email verified", async () => {
     const local = await users.create({
       email: "analyst@sentinelscan.io",
       name: "Security Analyst",
       passwordHash: "$2b$12$notarealhashbutlongenoughtolooklikeone000000000000000",
+      emailVerified: false, // Initially unverified local signup
     });
 
     const linked = await authenticateWithGoogle(users, identity);
@@ -93,6 +103,7 @@ describe("authenticateWithGoogle", () => {
     expect(linked.googleId).toBe(identity.googleId);
     // The local credential survives linking, so the user keeps both sign-in paths.
     expect(linked.passwordHash).toBe(local.passwordHash);
+    // Google verified the identity, so emailVerified is now true
     expect(linked.emailVerified).toBe(true);
     expect(users.rows.size).toBe(1);
   });

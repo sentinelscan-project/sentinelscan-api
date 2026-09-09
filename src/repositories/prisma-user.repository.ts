@@ -39,6 +39,13 @@ export const prismaUserRepository: UserRepository = {
     });
   },
 
+  setEmailVerified(id: string, emailVerified: boolean): Promise<UserRecord> {
+    return getPrismaClient().user.update({
+      where: { id },
+      data: { emailVerified },
+    });
+  },
+
   recordLogin(id: string, at: Date): Promise<UserRecord> {
     return getPrismaClient().user.update({
       where: { id },

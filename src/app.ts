@@ -9,6 +9,9 @@ import { healthRoutes } from "./routes/health.js";
 import { authRoutes } from "./modules/auth/auth.routes.js";
 import { prismaUserRepository } from "./repositories/prisma-user.repository.js";
 import type { UserRepository } from "./repositories/user.repository.js";
+import { prismaVerificationTokenRepository } from "./repositories/token.repository.js";
+import type { VerificationTokenRepository } from "./repositories/token.repository.js";
+import { defaultEmailService, type EmailService } from "./lib/email-service.js";
 
 export interface BuildAppOptions {
   /**
@@ -16,10 +19,22 @@ export interface BuildAppOptions {
    * tests inject an in-memory implementation so the suite needs no database.
    */
   userRepository?: UserRepository;
+  /**
+   * Persistence boundary for verification tokens. Defaults to the Prisma-backed repository.
+   */
+  tokenRepository?: VerificationTokenRepository;
+  /**
+   * Email delivery abstraction. Defaults to the configured provider (development, Resend, etc.).
+   */
+  emailService?: EmailService;
 }
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
-  const { userRepository = prismaUserRepository } = options;
+  const {
+    userRepository = prismaUserRepository,
+    tokenRepository = prismaVerificationTokenRepository,
+    emailService = defaultEmailService,
+  } = options;
 
   const app = fastify({
     logger: process.env.NODE_ENV === "test" ? false : { level: "info" },
@@ -31,6 +46,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     origin: [env.WEB_APP_URL],
     credentials: true,
   });
+
+  app.decorate("tokenRepository", tokenRepository);
+  app.decorate("emailService", emailService);
 
   app.register(authentication, { userRepository });
 
@@ -58,15 +76,34 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       });
     }
 
-    app.log.error(error);
+    // Check for Prisma errors and log actionable diagnostics for production server logs
+    if (typeof error === "object" && error !== null && "code" in error && typeof error.code === "string") {
+      if (error.code === "P2021") {
+        request.log.error(
+          { code: error.code, message: error.message },
+          "[Database Error] Database table does not exist. Migrations must be deployed using 'npx prisma migrate deploy'.",
+        );
+      } else {
+        request.log.error(
+          { code: error.code, message: error.message },
+          `[Database Error] Prisma error ${error.code} occurred during request execution.`,
+        );
+      }
+    } else {
+      app.log.error(error);
+    }
+
     const statusCode = ("statusCode" in error && typeof error.statusCode === "number")
       ? error.statusCode
       : 500;
-    const message = statusCode === 500 ? "Internal Server Error" : error.message;
+    const isInternal = statusCode >= 500;
+    const errorName = isInternal ? "Internal Server Error" : (error.name || "Error");
+    const message = isInternal ? "Internal Server Error" : error.message;
 
     return reply.status(statusCode).send({
       statusCode,
-      error: error.name || "Error",
+      error: errorName,
+      code: isInternal ? "INTERNAL_SERVER_ERROR" : (("code" in error && typeof error.code === "string") ? error.code : "ERROR"),
       message,
     });
   });

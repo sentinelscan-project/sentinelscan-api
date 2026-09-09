@@ -4,6 +4,15 @@ import type {
   UserRecord,
   UserRepository,
 } from "../../src/repositories/user.repository.js";
+import type {
+  VerificationTokenRecord,
+  VerificationTokenRepository,
+} from "../../src/repositories/token.repository.js";
+import type {
+  EmailResult,
+  EmailService,
+  SendVerificationEmailOptions,
+} from "../../src/lib/email-service.js";
 
 /** Mimics Prisma's unique-constraint violation so services can be tested against it. */
 class UniqueConstraintError extends Error {
@@ -21,10 +30,6 @@ export interface InMemoryUserRepository extends UserRepository {
   reset(): void;
 }
 
-/**
- * In-memory {@link UserRepository} used by the test suite so the API can be
- * exercised end to end without a PostgreSQL instance in CI.
- */
 export function createInMemoryUserRepository(): InMemoryUserRepository {
   const rows = new Map<string, UserRecord>();
 
@@ -104,6 +109,13 @@ export function createInMemoryUserRepository(): InMemoryUserRepository {
       return clone(user);
     },
 
+    async setEmailVerified(id: string, emailVerified: boolean): Promise<UserRecord> {
+      const user = requireUser(id);
+      user.emailVerified = emailVerified;
+      user.updatedAt = new Date();
+      return clone(user);
+    },
+
     async recordLogin(id: string, at: Date): Promise<UserRecord> {
       const user = requireUser(id);
       user.lastLoginAt = at;
@@ -111,4 +123,101 @@ export function createInMemoryUserRepository(): InMemoryUserRepository {
       return clone(user);
     },
   };
+}
+
+export interface InMemoryVerificationTokenRepository extends VerificationTokenRepository {
+  readonly rows: Map<string, VerificationTokenRecord>;
+  reset(): void;
+}
+
+export function createInMemoryVerificationTokenRepository(): InMemoryVerificationTokenRepository {
+  const rows = new Map<string, VerificationTokenRecord>();
+
+  function clone(token: VerificationTokenRecord): VerificationTokenRecord {
+    return { ...token };
+  }
+
+  return {
+    rows,
+
+    reset(): void {
+      rows.clear();
+    },
+
+    async create(userId: string, tokenHash: string, expiresAt: Date): Promise<VerificationTokenRecord> {
+      for (const token of rows.values()) {
+        if (token.tokenHash === tokenHash) {
+          throw new UniqueConstraintError("tokenHash");
+        }
+      }
+
+      const record: VerificationTokenRecord = {
+        id: randomUUID(),
+        userId,
+        tokenHash,
+        expiresAt,
+        usedAt: null,
+        createdAt: new Date(),
+      };
+      rows.set(record.id, record);
+      return clone(record);
+    },
+
+    async findByTokenHash(tokenHash: string): Promise<VerificationTokenRecord | null> {
+      for (const token of rows.values()) {
+        if (token.tokenHash === tokenHash) {
+          return clone(token);
+        }
+      }
+      return null;
+    },
+
+    async markUsed(id: string, usedAt: Date): Promise<VerificationTokenRecord> {
+      const record = rows.get(id);
+      if (!record) {
+        throw new Error(`Token ${id} not found`);
+      }
+      record.usedAt = usedAt;
+      return clone(record);
+    },
+
+    async invalidateAllForUser(userId: string): Promise<void> {
+      const now = new Date();
+      for (const token of rows.values()) {
+        if (token.userId === userId && token.usedAt === null) {
+          token.usedAt = now;
+        }
+      }
+    },
+
+    async findLatestForUser(userId: string): Promise<VerificationTokenRecord | null> {
+      let latest: VerificationTokenRecord | null = null;
+      for (const token of rows.values()) {
+        if (token.userId === userId) {
+          if (!latest || token.createdAt.getTime() > latest.createdAt.getTime()) {
+            latest = token;
+          }
+        }
+      }
+      return latest ? clone(latest) : null;
+    },
+  };
+}
+
+export class MockEmailService implements EmailService {
+  readonly provider = "mock";
+  readonly sentEmails: SendVerificationEmailOptions[] = [];
+
+  async sendVerificationEmail(options: SendVerificationEmailOptions): Promise<EmailResult> {
+    this.sentEmails.push({ ...options });
+    return {
+      delivered: true,
+      provider: "mock",
+      previewUrl: options.verificationUrl,
+    };
+  }
+
+  reset(): void {
+    this.sentEmails.length = 0;
+  }
 }

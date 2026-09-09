@@ -37,6 +37,13 @@ const baseEnvSchema = z.object({
   JWT_EXPIRES_IN: z.string().min(1).default("1d"),
   AUTH_COOKIE_NAME: z.string().min(1).default("sentinelscan_token"),
   WEB_APP_URL: z.string().url("WEB_APP_URL must be a valid URL").default("http://localhost:3000"),
+  EMAIL_PROVIDER: z.enum(["development", "resend", "smtp"]).default("development"),
+  EMAIL_FROM: z.string().default("SentinelScan <noreply@sentinelscan.io>"),
+  EMAIL_API_KEY: z.string().min(1).optional(),
+  SMTP_HOST: z.string().min(1).optional(),
+  SMTP_PORT: z.coerce.number().optional(),
+  SMTP_USER: z.string().min(1).optional(),
+  SMTP_PASS: z.string().min(1).optional(),
 });
 
 const envSchema = baseEnvSchema.and(googleOAuthSchema);

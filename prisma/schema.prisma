@@ -17,15 +17,31 @@ generator client {
 /// Future stages will hang user-owned resources (targets, scans, findings, AI
 /// analyses, reports) off this model via relations; none of them exist yet.
 model User {
-  id            String    @id @default(uuid())
-  email         String    @unique
-  name          String
-  passwordHash  String?
-  googleId      String?   @unique
-  emailVerified Boolean   @default(false)
-  lastLoginAt   DateTime?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  id                 String                   @id @default(uuid())
+  email              String                   @unique
+  name               String
+  passwordHash       String?
+  googleId           String?                  @unique
+  emailVerified      Boolean                  @default(false)
+  lastLoginAt        DateTime?
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
+  verificationTokens EmailVerificationToken[]
 
   @@map("users")
 }
+
+model EmailVerificationToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("email_verification_tokens")
+}
+
