@@ -24,6 +24,8 @@ declare module "fastify" {
     emailService: import("../lib/email-service.js").EmailService;
     /** The target persistence boundary the app was built with. */
     targetRepository: import("../repositories/target.repository.js").TargetRepository;
+    /** The scan persistence boundary the app was built with. */
+    scanRepository: import("../repositories/scan.repository.js").ScanRepository;
   }
 
   interface FastifyRequest {

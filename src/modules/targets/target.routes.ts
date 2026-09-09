@@ -8,6 +8,9 @@ import {
   updateTargetBodySchema,
 } from "./target.schemas.js";
 import { createTarget, deleteTarget, getTarget, listTargets, updateTarget } from "./target.service.js";
+import { toPublicScan } from "../../repositories/scan.repository.js";
+import { createScanParamsSchema } from "../scans/scan.schemas.js";
+import { createScan } from "../scans/scan.service.js";
 
 /**
  * Every target belongs to whoever created it. `fastify.authenticate` already
@@ -67,5 +70,16 @@ export const targetRoutes: FastifyPluginAsync = async (fastify: FastifyInstance)
     const params = parseOrThrow(targetIdParamsSchema, request.params);
     await deleteTarget(fastify.targetRepository, ownerId, params.id);
     return reply.status(204).send();
+  });
+
+  // Nested under the target resource path rather than living in
+  // scan.routes.ts (which owns the top-level /scans/* routes): creating a
+  // scan is fundamentally "create a scan *for this target*", and reuses this
+  // module's own ownership-scoped target lookup directly.
+  fastify.post("/:targetId/scans", async (request, reply) => {
+    const ownerId = requireOwnerId(request);
+    const params = parseOrThrow(createScanParamsSchema, request.params);
+    const scan = await createScan(fastify.targetRepository, fastify.scanRepository, ownerId, params.targetId);
+    return reply.status(201).send({ scan: toPublicScan(scan) });
   });
 };

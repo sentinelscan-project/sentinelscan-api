@@ -462,4 +462,34 @@ describe("DELETE /targets/:id", () => {
 
     expect(response.statusCode).toBe(400);
   });
+
+  it("translates a foreign-key violation (scan history exists) into 409 TARGET_HAS_SCANS", async () => {
+    // Stage 3 gives Scan.targetId an `onDelete: Restrict` foreign key, so
+    // deleting a target with scan history fails at the database with a
+    // P2003. The in-memory TargetRepository has no concept of scans, so
+    // this simulates that failure directly on the one method involved,
+    // proving `deleteTarget` (target.service.ts) translates it into a clean
+    // 409 rather than leaking the raw Prisma error over HTTP.
+    const session = await createSession("owner-a@example.com");
+    const created = JSON.parse((await authedRequest("POST", "/targets", session, validTarget)).payload);
+
+    const originalDeleteForOwner = targets.deleteForOwner;
+    targets.deleteForOwner = () => {
+      const fkError = new Error("Foreign key constraint failed on the field: `targetId`");
+      Object.assign(fkError, { code: "P2003", name: "PrismaClientKnownRequestError" });
+      return Promise.reject(fkError);
+    };
+
+    try {
+      const response = await authedRequest("DELETE", `/targets/${created.target.id}`, session);
+
+      expect(response.statusCode).toBe(409);
+      const body = JSON.parse(response.payload);
+      expect(body.code).toBe("TARGET_HAS_SCANS");
+      expect(body.message).not.toContain("Prisma");
+      expect(body.message).not.toContain("P2003");
+    } finally {
+      targets.deleteForOwner = originalDeleteForOwner;
+    }
+  });
 });

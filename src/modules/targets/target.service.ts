@@ -1,5 +1,5 @@
 import { ConflictError, NotFoundError } from "../../lib/errors.js";
-import { isUniqueConstraintError } from "../../lib/prisma-errors.js";
+import { isForeignKeyConstraintError, isUniqueConstraintError } from "../../lib/prisma-errors.js";
 import type {
   TargetRecord,
   TargetRepository,
@@ -9,6 +9,21 @@ import type { CreateTargetBody, UpdateTargetBody } from "./target.schemas.js";
 
 function duplicateTargetError(): ConflictError {
   return new ConflictError("A target with this URL already exists", "TARGET_ALREADY_EXISTS");
+}
+
+/**
+ * Stage 3 gives `Scan.targetId` an `onDelete: Restrict` foreign key
+ * (deliberately, to preserve scan history — see the comment on `Scan` in
+ * `schema.prisma`), so deleting a target that has scan history now fails at
+ * the database. Translated here into the same clean, non-leaking error shape
+ * as every other conflict, rather than letting a raw Prisma constraint
+ * violation reach the client.
+ */
+function targetHasScansError(): ConflictError {
+  return new ConflictError(
+    "This target has scan history and cannot be deleted",
+    "TARGET_HAS_SCANS",
+  );
 }
 
 /**
@@ -85,8 +100,15 @@ export async function updateTarget(
 }
 
 export async function deleteTarget(repository: TargetRepository, ownerId: string, id: string): Promise<void> {
-  const deleted = await repository.deleteForOwner(id, ownerId);
-  if (!deleted) {
-    throw targetNotFoundError();
+  try {
+    const deleted = await repository.deleteForOwner(id, ownerId);
+    if (!deleted) {
+      throw targetNotFoundError();
+    }
+  } catch (error) {
+    if (isForeignKeyConstraintError(error)) {
+      throw targetHasScansError();
+    }
+    throw error;
   }
 }

@@ -14,8 +14,12 @@ generator client {
 /// local account has been linked to a Google identity. Google-only users
 /// therefore have a null `passwordHash`.
 ///
-/// Stage 2 attaches the first user-owned resource, `Target`, via `targets`.
-/// Later stages will hang scans, findings, AI analyses and reports off it too.
+/// Stage 2 attached the first user-owned resource, `Target`, via `targets`.
+/// Stage 3 adds `scans`: every scan records who requested it, independent of
+/// (but in practice always aligned with) who currently owns its target — see
+/// the delete-behavior comment on `Scan` for why both relations are
+/// `Restrict` rather than `Cascade`. Later stages will hang findings, AI
+/// analyses and reports off it too.
 model User {
   id                 String                   @id @default(uuid())
   email              String                   @unique
@@ -28,6 +32,7 @@ model User {
   updatedAt          DateTime                 @updatedAt
   verificationTokens EmailVerificationToken[]
   targets            Target[]
+  scans              Scan[]
 
   @@map("users")
 }
@@ -73,7 +78,8 @@ model Target {
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
 
-  owner User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  owner User   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  scans Scan[]
 
   // A lookup index for "list my targets", and a uniqueness guarantee that
   // stops one user from registering the same URL twice. Two different users
@@ -83,5 +89,66 @@ model Target {
   @@unique([ownerId, url])
   @@index([ownerId])
   @@map("targets")
+}
+
+/// The lifecycle state of a `Scan`. See the state-machine comment on `Scan`
+/// for which transitions between these are actually legal.
+enum ScanStatus {
+  queued
+  running
+  completed
+  failed
+  cancelled
+}
+
+/// One requested (or completed, failed, cancelled) execution of a security
+/// assessment against a `Target`.
+///
+/// Stage 3 is orchestration and persistence only: creating a `Scan` never
+/// makes a network request, resolves DNS, crawls, or invokes any scanner.
+/// `status` starts at `queued` and stays there until Stage 4's real executor
+/// (see `modules/scans/scan-executor.ts`) exists to advance it — nothing in
+/// this codebase marks a scan `running`/`completed`/`failed` on its own.
+///
+/// Delete behavior — deliberately `Restrict` on both relations, not
+/// `Cascade`:
+/// - `target` (→ Target.id): a `Scan` is the historical record of an
+///   assessment that was requested (and possibly ran). Cascading it away
+///   whenever its `Target` is deleted would silently destroy that audit
+///   trail. A target with any scan history therefore cannot be deleted until
+///   an explicit archival/retention story exists; `DELETE /targets/:id`
+///   reports a clear `409 TARGET_HAS_SCANS` instead of letting Postgres
+///   reject the statement with a raw constraint error.
+/// - `requestedBy` (→ User.id): for the same reason — who requested a scan
+///   is part of the audit record. There is no account-deletion endpoint
+///   anywhere in this codebase yet, so this cannot currently be exercised,
+///   but it is set deliberately rather than left to a default: whenever
+///   account deletion is built, deleting a user with scan history must fail
+///   loudly (and be handled explicitly), not silently erase who requested
+///   what. Using `Restrict` here rather than `Cascade` also avoids relying on
+///   an unspecified evaluation order between this relation and `target`'s
+///   `Restrict` for the same row — both simply block, independently and
+///   consistently.
+model Scan {
+  id            String     @id @default(uuid())
+  targetId      String
+  requestedById String
+  status        ScanStatus @default(queued)
+  startedAt     DateTime?
+  completedAt   DateTime?
+  errorMessage  String?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  target      Target @relation(fields: [targetId], references: [id], onDelete: Restrict)
+  requestedBy User   @relation(fields: [requestedById], references: [id], onDelete: Restrict)
+
+  @@index([targetId])
+  @@index([requestedById])
+  @@index([status])
+  // Supports the "my scans, newest first" query — the actual shape GET
+  // /scans runs — better than a bare index on `createdAt` alone would.
+  @@index([requestedById, createdAt])
+  @@map("scans")
 }
 

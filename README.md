@@ -1,9 +1,9 @@
 # SentinelScan API (`sentinelscan-api`)
 
 ## Overview
-`sentinelscan-api` is the backend API service for **SentinelScan**. Built with Fastify and TypeScript, it provides the core API foundation, environment configuration validation with Zod, PostgreSQL persistence using Prisma, identity and authentication, authorized target management, centralized logging and error handling, and container packaging.
+`sentinelscan-api` is the backend API service for **SentinelScan**. Built with Fastify and TypeScript, it provides the core API foundation, environment configuration validation with Zod, PostgreSQL persistence using Prisma, identity and authentication, authorized target management, scan orchestration, centralized logging and error handling, and container packaging.
 
-> **Stage 2 Notice**: This repository currently implements the backend foundation (Stage 0), identity and authentication (Stage 1), and target registration/management (Stage 2). Domain features beyond that — endpoint discovery, the SentinelScan scanner engine, OWASP ZAP integration, finding normalization and correlation, AI security analysis, and reporting — are deliberately not implemented yet. Registering a target does **not** trigger any network request, DNS resolution, crawl, or scan; a `Target` row is purely a record of an authorized assessment subject until later stages act on it. `User` and `Target` are the only domain models so far; later stages will attach scans, findings, analyses and reports to `Target`.
+> **Stage 3 Notice**: This repository currently implements the backend foundation (Stage 0), identity and authentication (Stage 1), target registration/management (Stage 2), and scan orchestration (Stage 3). **Stage 3 establishes scan orchestration only — actual scanning is not implemented yet.** Creating a scan persists a `Scan` row with `status: "queued"` and nothing more: no crawling, no HTTP requests to the target, no DNS resolution, no OWASP ZAP integration. A scan simply stays `queued` — there is no code path anywhere in this repository that ever advances it to `running`. OWASP ZAP integration (Stage 4) will introduce the executor that actually does that. `User`, `Target` and `Scan` are the only domain models so far; later stages will attach findings, AI analyses and reports to `Scan`.
 
 ---
 
@@ -28,7 +28,7 @@
 sentinelscan-api/
 ├── prisma/
 │   ├── migrations/           # Versioned SQL migrations
-│   └── schema.prisma         # Datasource, generator, User and Target models
+│   └── schema.prisma         # Datasource, generator, User, Target and Scan models
 ├── src/
 │   ├── app.ts                # Fastify app factory with middleware & error handling
 │   ├── config.ts             # Zod environment validation & startup check
@@ -40,7 +40,7 @@ sentinelscan-api/
 │   │   ├── email.ts          # Email normalization
 │   │   ├── errors.ts         # AppError hierarchy with HTTP status codes
 │   │   ├── password.ts       # bcrypt hashing / verification
-│   │   ├── prisma-errors.ts  # Unique-constraint detection
+│   │   ├── prisma-errors.ts  # Unique-constraint & foreign-key-constraint detection
 │   │   ├── url.ts            # Target URL validation & normalization
 │   │   └── validation.ts     # Zod → 400 ValidationError bridge
 │   ├── modules/
@@ -49,10 +49,15 @@ sentinelscan-api/
 │   │   │   ├── auth.schemas.ts   # Zod request schemas & password policy
 │   │   │   ├── auth.service.ts   # Registration, login, verification, Google account resolution
 │   │   │   └── google.routes.ts  # /auth/google, /auth/google/callback
-│   │   └── targets/
-│   │       ├── target.routes.ts  # /targets CRUD, all requiring authentication
-│   │       ├── target.schemas.ts # Zod request schemas & URL normalization wiring
-│   │       └── target.service.ts # Ownership-enforced create/list/get/update/delete
+│   │   ├── targets/
+│   │   │   ├── target.routes.ts  # /targets CRUD + nested POST /:targetId/scans
+│   │   │   ├── target.schemas.ts # Zod request schemas & URL normalization wiring
+│   │   │   └── target.service.ts # Ownership-enforced create/list/get/update/delete
+│   │   └── scans/
+│   │       ├── scan.routes.ts    # GET /scans, GET /scans/:id, POST /scans/:id/cancel
+│   │       ├── scan.schemas.ts   # Zod request schemas, list-query pagination
+│   │       ├── scan.service.ts   # Lifecycle state machine, ownership-enforced operations
+│   │       └── scan-executor.ts  # ScanExecutor interface Stage 4 will implement with ZAP
 │   ├── plugins/
 │   │   └── authentication.ts # JWT + cookie session, `authenticate` preHandler
 │   ├── repositories/
@@ -60,7 +65,9 @@ sentinelscan-api/
 │   │   ├── prisma-user.repository.ts   # Prisma implementation
 │   │   ├── token.repository.ts         # Email verification token repository
 │   │   ├── target.repository.ts        # TargetRepository interface & PublicTarget
-│   │   └── prisma-target.repository.ts # Prisma implementation (ownership-scoped queries)
+│   │   ├── prisma-target.repository.ts # Prisma implementation (ownership-scoped queries)
+│   │   ├── scan.repository.ts          # ScanRepository interface & PublicScan
+│   │   └── prisma-scan.repository.ts   # Prisma implementation (atomic CAS transitions)
 │   ├── routes/
 │   │   └── health.ts         # GET /health endpoint
 │   └── types/
@@ -68,10 +75,12 @@ sentinelscan-api/
 ├── tests/
 │   ├── helpers/
 │   │   ├── in-memory-user.repository.ts   # Database-free User/token/email test doubles
-│   │   └── in-memory-target.repository.ts # Database-free TargetRepository for tests
+│   │   ├── in-memory-target.repository.ts # Database-free TargetRepository for tests
+│   │   └── in-memory-scan.repository.ts   # Database-free ScanRepository (reproduces CAS semantics)
 │   ├── auth.test.ts          # Registration, verification, login, session, logout tests
 │   ├── google-auth.test.ts   # Google identity & unconfigured-provider tests
 │   ├── targets.test.ts       # Target CRUD, ownership isolation, validation tests
+│   ├── scans.test.ts         # Scan orchestration, lifecycle, ownership isolation tests
 │   └── health.test.ts        # Vitest integration test
 ├── .dockerignore
 ├── .env.example
@@ -216,9 +225,31 @@ An authorized web application a user has registered for future security assessme
 
 Indexed on `ownerId` for the "list my targets" query, with a unique constraint on `(ownerId, url)`: one user cannot register the same URL twice, but two different users can each register the same URL — e.g. a shared staging environment both are separately authorized to test.
 
-Later stages will hang `Scan → Finding → AiAnalysis → Report` off `Target`; none of those models exist yet.
+A target with scan history (any `Scan` row referencing it) **cannot be deleted** — `DELETE /targets/:id` returns `409 TARGET_HAS_SCANS`. See `Scan`'s delete-behavior note below for why.
 
-Persistence for both models is reached through a repository interface (`UserRepository`, `TargetRepository`) rather than Prisma directly, so route handlers stay database-agnostic and the test suite can run against an in-memory implementation with no PostgreSQL instance.
+### `Scan` (table `scans`)
+
+One requested (or completed, failed, cancelled) execution of a security assessment against a `Target`. **Stage 3 is orchestration and persistence only** — creating a `Scan` never makes a network request, resolves DNS, crawls, or invokes OWASP ZAP or any other scanner. See [Scan lifecycle](#scan-lifecycle) for exactly what does and does not happen to a scan's `status` in this stage.
+
+| Column | Type | Notes |
+| :--- | :--- | :--- |
+| `id` | `String` (uuid) | Primary key |
+| `targetId` | `String` | Foreign key to `Target.id`, `onDelete: Restrict` |
+| `requestedById` | `String` | Foreign key to `User.id`, `onDelete: Restrict`; always derived from the authenticated session, never from client input |
+| `status` | `ScanStatus` | `"queued"` (default) · `"running"` · `"completed"` · `"failed"` · `"cancelled"` |
+| `startedAt` | `DateTime?` | Set when the scan transitions to `running`; `null` until then |
+| `completedAt` | `DateTime?` | Set when the scan reaches any terminal state (`completed`/`failed`/`cancelled`) |
+| `errorMessage` | `String?` | Set when a scan fails; otherwise `null` |
+| `createdAt` | `DateTime` | When the scan was requested |
+| `updatedAt` | `DateTime` | Auto-maintained update timestamp |
+
+Indexed on `targetId`, `requestedById`, and `status` individually, plus a composite `(requestedById, createdAt)` index supporting the actual "my scans, newest first" query `GET /scans` runs.
+
+**Delete behavior — deliberately `Restrict` on both foreign keys, not `Cascade`:** a `Scan` is the historical record of an assessment that was requested (and possibly ran), so cascading it away whenever its `Target` or requesting `User` is deleted would silently destroy that audit trail. A target with any scan history cannot be deleted (`409 TARGET_HAS_SCANS`) until an explicit archival/retention story exists in a later stage. There is no account-deletion endpoint anywhere in this codebase yet, so the `requestedById` side of this cannot currently be exercised through the API — it is set deliberately rather than left to a default, so that whenever account deletion is built, deleting a user with scan history fails loudly instead of silently erasing who requested what.
+
+Later stages will hang `Finding → AiAnalysis → Report` off `Scan`; none of those models exist yet.
+
+Persistence for all three models is reached through a repository interface (`UserRepository`, `TargetRepository`, `ScanRepository`) rather than Prisma directly, so route handlers stay database-agnostic and the test suite can run against an in-memory implementation with no PostgreSQL instance. `ScanRepository`'s status-transition method is a compare-and-swap (`UPDATE ... WHERE status = $expected`, via Prisma's `updateMany`), which is what makes two simultaneous requests to cancel (or otherwise transition) the same scan resolve safely — see [Scan lifecycle](#scan-lifecycle).
 
 ---
 
@@ -372,7 +403,7 @@ Callers learn *whether* a credential exists, never what it is.
 
 ### Targets
 
-Every `/targets` route requires authentication (the same session cookie / bearer token as everything else) and is scoped entirely to `request.currentUser.id`: the owner is always derived from the session, never accepted from the request body, and a target belonging to another user is treated identically to a target that does not exist. None of these endpoints make a network request to the target's `url` — no crawling, scanning, or DNS resolution happens in Stage 2.
+Every `/targets` route requires authentication (the same session cookie / bearer token as everything else) and is scoped entirely to `request.currentUser.id`: the owner is always derived from the session, never accepted from the request body, and a target belonging to another user is treated identically to a target that does not exist. None of these endpoints make a network request to the target's `url` — no crawling, scanning, or DNS resolution happens anywhere in this codebase.
 
 #### `POST /targets`
 
@@ -414,6 +445,16 @@ Any subset of `name`, `url`, `description`, `status`. Omitted fields are left un
 - `204` — no body
 - `400` `VALIDATION_ERROR` — `:id` is not a well-formed UUID
 - `404` `TARGET_NOT_FOUND` — no such target, *or* it belongs to a different user
+- `409` `TARGET_HAS_SCANS` — this target has scan history and cannot be deleted (Stage 3; see the `Scan` delete-behavior note in [Data Model](#scan-table-scans))
+
+#### `POST /targets/:targetId/scans`
+
+Creates a scan for this target. See [Scans](#scans) below — this is the scan-creation endpoint, nested here because it is fundamentally "create a scan *for this target*" and reuses this module's own ownership-scoped target lookup.
+
+- `201` — `{ "scan": { ... } }`, `status: "queued"`
+- `400` `VALIDATION_ERROR` — `:targetId` is not a well-formed UUID
+- `404` `TARGET_NOT_FOUND` — no such target, *or* it belongs to a different user
+- `409` `TARGET_NOT_ACTIVE` — the target's `status` is `"inactive"`
 
 #### Safe target representation
 
@@ -437,6 +478,78 @@ Any subset of `name`, `url`, `description`, `status`. Omitted fields are left un
 - **URL**: required, 1–2048 characters before normalization, must parse as an absolute `http:`/`https:` URL with no embedded username/password. Normalized via the WHATWG `URL` parser's own serialization (`new URL(input).href`) — lower-cased scheme/host, default ports dropped, root path filled in — so the same target registered twice in a different-but-equivalent form is recognized as a duplicate.
 - **Description**: optional, up to 1000 characters.
 - **Status**: `"active"` or `"inactive"` only.
+
+### Scans
+
+**Stage 3 establishes scan orchestration only. Actual scanning is not implemented yet.** `POST /targets/:targetId/scans` persists a `Scan` row with `status: "queued"` and returns immediately — nothing crawls the target, nothing calls OWASP ZAP (that is Stage 4), and nothing anywhere in this codebase ever advances a scan to `running` on its own. A queued scan stays queued until a real execution mechanism exists.
+
+Every `/scans` route requires authentication and is scoped entirely to `request.currentUser.id` as the *requester* — the same non-enumerable-404 rule as targets applies: a scan belonging to another user is indistinguishable from one that does not exist.
+
+#### Scan lifecycle
+
+```
+queued ──┬──> running ──┬──> completed
+         │              ├──> failed
+         └──> cancelled ┴──> cancelled
+```
+
+| From | May transition to |
+| :--- | :--- |
+| `queued` | `running`, `cancelled` |
+| `running` | `completed`, `failed`, `cancelled` |
+| `completed` / `failed` / `cancelled` | *(terminal — nothing)* |
+
+This table (`VALID_TRANSITIONS` in `scan.service.ts`) is the single source of truth for every transition check in this codebase; there is no second, separately-maintained list anywhere else. Every transition is applied as an atomic compare-and-swap (`UPDATE ... WHERE status = $expected`) at the database layer, not just checked in application code — so two simultaneous requests to transition the same scan (e.g. two `POST /scans/:id/cancel` calls racing each other) can never both succeed: exactly one wins, the other receives a clean `409 INVALID_SCAN_TRANSITION` rather than a corrupted or double-applied state.
+
+`queued → running`, `running → completed`, and `running → failed` are **not reachable through any HTTP endpoint in Stage 3** — they exist as internal functions in `scan.service.ts` (`startScan`, `completeScan`, `failScan`) for Stage 4's executor to call as a real scan actually progresses, and are covered directly by tests in the meantime. Only `POST /scans/:id/cancel` (below) is reachable over HTTP in this stage, and it only ever moves a scan into `cancelled`.
+
+#### `GET /scans`
+
+Query parameters (all optional):
+
+| Parameter | Notes |
+| :--- | :--- |
+| `status` | One of `queued`, `running`, `completed`, `failed`, `cancelled` |
+| `targetId` | Must be a well-formed UUID |
+| `limit` | 1–100, default 20 |
+| `offset` | ≥ 0, default 0 |
+
+There is no established pagination convention elsewhere in this API (`GET /targets` returns everything unpaged), so this is a plain, unopinionated `limit`/`offset` scheme rather than an attempt to match a precedent that doesn't exist.
+
+- `200` — `{ "scans": [ { ... }, ... ], "limit": 20, "offset": 0, "hasMore": false }`, newest first, containing only scans requested by the caller
+- `400` `VALIDATION_ERROR` — an invalid filter value, or `limit`/`offset` out of range
+
+#### `GET /scans/:id`
+
+- `200` — `{ "scan": { ... } }`
+- `400` `VALIDATION_ERROR` — `:id` is not a well-formed UUID
+- `404` `SCAN_NOT_FOUND` — no such scan, *or* it was requested by a different user
+
+#### `POST /scans/:id/cancel`
+
+Valid only from `queued` or `running`. If the scan had already started, `startedAt` is left untouched (cancelling does not rewrite history); `completedAt` is set either way, since `cancelled` is terminal. No scanner-result fields are set — there is nothing to fabricate.
+
+- `200` — `{ "scan": { ... } }`, `status: "cancelled"`
+- `400` `VALIDATION_ERROR` — `:id` is not a well-formed UUID
+- `404` `SCAN_NOT_FOUND` — no such scan, *or* it was requested by a different user
+- `409` `INVALID_SCAN_TRANSITION` — the scan is already `completed`, `failed`, or `cancelled`
+
+#### Safe scan representation
+
+```json
+{
+  "id": "9c2a...",
+  "targetId": "6f1e...",
+  "status": "queued",
+  "startedAt": null,
+  "completedAt": null,
+  "errorMessage": null,
+  "createdAt": "2026-09-11T10:00:00.000Z",
+  "updatedAt": "2026-09-11T10:00:00.000Z"
+}
+```
+
+`requestedById` is never included — the caller already knows every scan returned here is theirs.
 
 ### Error format
 
