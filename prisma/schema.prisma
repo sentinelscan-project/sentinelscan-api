@@ -6,3 +6,26 @@ datasource db {
 generator client {
   provider = "prisma-client-js"
 }
+
+/// Application user.
+///
+/// A user authenticates either with a local email/password credential
+/// (`passwordHash`) or through Google OAuth/OIDC (`googleId`), or both once a
+/// local account has been linked to a Google identity. Google-only users
+/// therefore have a null `passwordHash`.
+///
+/// Future stages will hang user-owned resources (targets, scans, findings, AI
+/// analyses, reports) off this model via relations; none of them exist yet.
+model User {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  name          String
+  passwordHash  String?
+  googleId      String?   @unique
+  emailVerified Boolean   @default(false)
+  lastLoginAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@map("users")
+}

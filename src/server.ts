@@ -1,5 +1,6 @@
 import { env } from "./config.js";
 import { buildApp } from "./app.js";
+import { disconnectPrisma } from "./db/prisma.js";
 
 const app = buildApp();
 
@@ -23,6 +24,7 @@ for (const signal of signals) {
     app.log.info(`Received ${signal}, shutting down gracefully...`);
     try {
       await app.close();
+      await disconnectPrisma();
       app.log.info("Server closed successfully.");
       process.exit(0);
     } catch (err) {
