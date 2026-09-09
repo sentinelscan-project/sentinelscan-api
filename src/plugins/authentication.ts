@@ -38,6 +38,7 @@ export const sessionCookieOptions = {
   httpOnly: true,
   secure: isProduction,
   sameSite: isProduction ? ("none" as const) : ("lax" as const),
+  partitioned: isProduction,
   path: "/",
 } as const;
 
@@ -94,10 +95,26 @@ async function authenticationPlugin(
   fastify.decorateRequest("currentUser", null);
 
   fastify.decorate("authenticate", async (request: FastifyRequest, _reply: FastifyReply): Promise<void> => {
+    const rawCookie = request.headers.cookie;
+    const cookieNames = rawCookie ? Object.keys(request.cookies) : [];
+    const hasAuthCookie = Boolean(request.cookies[env.AUTH_COOKIE_NAME]);
+
     let payload: AuthTokenPayload;
     try {
       payload = await request.jwtVerify<AuthTokenPayload>();
     } catch (error) {
+      request.log.warn(
+        {
+          hasCookieHeader: Boolean(rawCookie),
+          cookieNames,
+          hasAuthCookie,
+          errCode:
+            typeof error === "object" && error !== null && "code" in error
+              ? (error as { code: unknown }).code
+              : undefined,
+        },
+        "Authentication check failed in jwtVerify",
+      );
       throw toAuthError(error);
     }
 

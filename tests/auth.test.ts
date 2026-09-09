@@ -531,5 +531,6 @@ describe("POST /auth/logout", () => {
     // In test environment (NODE_ENV !== "production"), sameSite is "lax" and secure is false
     expect(sessionCookieOptions.sameSite).toBe("lax");
     expect(sessionCookieOptions.secure).toBe(false);
+    expect(sessionCookieOptions.partitioned).toBe(false);
   });
 });
