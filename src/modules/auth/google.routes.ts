@@ -109,9 +109,19 @@ export const googleAuthRoutes: FastifyPluginAsync = async (fastify: FastifyInsta
       if (error instanceof UnauthorizedError) {
         throw error;
       }
-      // Never surface the provider's raw error to the client; it can contain
-      // request-specific details that are not ours to disclose.
-      fastify.log.error(error, "Google OAuth callback failed");
+      // Never surface the provider's raw error to the client, and never log it
+      // wholesale either: the underlying HTTP client error from the token
+      // exchange can carry the outgoing request (including the authorization
+      // code and, via the Authorization header, the client secret) on nested
+      // `config`/`request` properties that a generic logger would happily
+      // serialize. Only a name and message are safe to record.
+      fastify.log.error(
+        {
+          errName: error instanceof Error ? error.name : "UnknownError",
+          errMessage: error instanceof Error ? error.message : String(error),
+        },
+        "Google OAuth callback failed",
+      );
       throw new UnauthorizedError("Google authentication failed", "GOOGLE_AUTH_FAILED");
     }
 

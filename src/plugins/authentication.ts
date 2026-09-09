@@ -33,12 +33,25 @@ const isProduction = env.NODE_ENV === "production";
  * In local development / test:
  * - `secure`: false (allows plain HTTP).
  * - `sameSite`: "lax" (modern browsers reject SameSite=None over insecure HTTP).
+ *
+ * Deliberately NOT `partitioned`. CHIPS (`Partitioned`) keys a cookie to the
+ * top-level site that was active when it was set, which is meant for a
+ * resource embedded via iframe across many different embedding sites. Here
+ * the cookie is set during a full top-level redirect chain that ends on the
+ * API's own origin (Google → `/auth/google/callback` → 302), so a partitioned
+ * cookie would be stored under the partition key "onrender.com". Every later
+ * request is an ordinary cross-site `fetch` made while the top-level site is
+ * "vercel.app" — a different partition key — so the browser would silently
+ * never attach the cookie to it. That is the exact "cookie is stored but
+ * never sent" failure mode: the callback log shows the cookie being issued,
+ * yet `GET /auth/me` still comes back 401. A plain (non-partitioned)
+ * `SameSite=None; Secure` cookie is what this two-origin, non-embedded
+ * architecture actually needs.
  */
 export const sessionCookieOptions = {
   httpOnly: true,
   secure: isProduction,
   sameSite: isProduction ? ("none" as const) : ("lax" as const),
-  partitioned: isProduction,
   path: "/",
 } as const;
 

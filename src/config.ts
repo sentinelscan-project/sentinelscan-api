@@ -47,14 +47,14 @@ const baseEnvSchema = z.object({
   JWT_EXPIRES_IN: z.string().min(1).default("1d"),
   AUTH_COOKIE_NAME: z.string().min(1).default("sentinelscan_token"),
   WEB_APP_URL: z.string().url("WEB_APP_URL must be a valid URL").default("http://localhost:3000"),
-  EMAIL_PROVIDER: z.enum(["development", "resend", "smtp"]).default("development"),
+  // "smtp" is deliberately not an accepted value here: no SMTP transport is
+  // implemented in `email-service.ts`, so accepting it would let an operator
+  // configure something that silently falls back to development-mode console
+  // logging instead of the real delivery they asked for.
+  EMAIL_PROVIDER: z.enum(["development", "resend"]).default("development"),
   EMAIL_FROM: z.string().default("SentinelScan <noreply@sentinelscan.io>"),
   EMAIL_API_KEY: optionalNonEmptyString,
   RESEND_API_KEY: optionalNonEmptyString,
-  SMTP_HOST: optionalNonEmptyString,
-  SMTP_PORT: z.preprocess((val) => (val === "" ? undefined : val), z.coerce.number().optional()),
-  SMTP_USER: optionalNonEmptyString,
-  SMTP_PASS: optionalNonEmptyString,
 });
 
 const envSchema = baseEnvSchema.and(googleOAuthSchema);

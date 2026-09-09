@@ -531,6 +531,14 @@ describe("POST /auth/logout", () => {
     // In test environment (NODE_ENV !== "production"), sameSite is "lax" and secure is false
     expect(sessionCookieOptions.sameSite).toBe("lax");
     expect(sessionCookieOptions.secure).toBe(false);
-    expect(sessionCookieOptions.partitioned).toBe(false);
+    // Deliberately not `partitioned`: CHIPS scopes a cookie to the top-level
+    // site active when it was set. Setting it during the Google callback's
+    // top-level redirect (top-level site = the API's own origin) would key it
+    // under a partition that the frontend's later cross-site fetches (top-level
+    // site = the web app's origin) never revisit, so the browser would store
+    // the cookie but never attach it — the cookie-issued-yet-/auth/me-401
+    // failure mode. See the comment on `sessionCookieOptions` in
+    // `src/plugins/authentication.ts`.
+    expect(sessionCookieOptions).not.toHaveProperty("partitioned");
   });
 });
