@@ -64,8 +64,12 @@ const baseEnvSchema = z.object({
   // `api.disablekey=true`) but is supported for any deployment that enables
   // it; it is only ever attached to outgoing requests server-side and is
   // never logged or sent to the browser.
-  // ---------------------------------------------------------------------
-  ZAP_BASE_URL: z.string().url("ZAP_BASE_URL must be a valid URL"),
+  ZAP_BASE_URL: z.preprocess(
+    (val) => (typeof val === "string" && val.trim() !== "" ? val : process.env.ZAP_SERVICE_URL),
+    z.string().url("ZAP_BASE_URL must be a valid URL"),
+  ),
+  /** Legacy alias from Stage 0; ZAP_BASE_URL is canonical. */
+  ZAP_SERVICE_URL: optionalNonEmptyString,
   ZAP_API_KEY: optionalNonEmptyString,
   /** Per-HTTP-call timeout against the ZAP daemon. */
   ZAP_HTTP_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
@@ -114,6 +118,11 @@ export function parseEnv(customEnv?: Record<string, string | undefined>): Env {
     envToParse.DATABASE_URL = envToParse.DATABASE_URL || "postgresql://mock:mock@localhost:5432/sentinelscan_test";
     envToParse.ZAP_BASE_URL = envToParse.ZAP_BASE_URL || "http://localhost:8090";
     envToParse.JWT_SECRET = envToParse.JWT_SECRET || "test-only-jwt-secret-value-not-for-production-use";
+  }
+
+  // Support legacy ZAP_SERVICE_URL as an alias if ZAP_BASE_URL is not set
+  if (!envToParse.ZAP_BASE_URL && envToParse.ZAP_SERVICE_URL) {
+    envToParse.ZAP_BASE_URL = envToParse.ZAP_SERVICE_URL;
   }
 
   const result = envSchema.safeParse(envToParse);
