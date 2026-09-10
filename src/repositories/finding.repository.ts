@@ -127,7 +127,8 @@ export interface PublicFinding {
   instances: PublicFindingInstance[];
 }
 
-function toReferenceList(value: unknown): string[] {
+/** Exported for reuse by `modules/analysis/` — the same `Finding.references` JSON shape feeds AI analysis input. */
+export function toReferenceList(value: unknown): string[] {
   if (!Array.isArray(value)) {
     return [];
   }

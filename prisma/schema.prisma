@@ -140,9 +140,12 @@ model Scan {
   createdAt     DateTime   @default(now())
   updatedAt     DateTime   @updatedAt
 
-  target      Target    @relation(fields: [targetId], references: [id], onDelete: Restrict)
-  requestedBy User      @relation(fields: [requestedById], references: [id], onDelete: Restrict)
+  target      Target            @relation(fields: [targetId], references: [id], onDelete: Restrict)
+  requestedBy User              @relation(fields: [requestedById], references: [id], onDelete: Restrict)
   findings    Finding[]
+  /// At most one per scan in Stage 6 — see the uniqueness-strategy comment on
+  /// `SecurityAnalysis.scanId` below.
+  analysis    SecurityAnalysis?
 
   @@index([targetId])
   @@index([requestedById])
@@ -256,8 +259,15 @@ model Finding {
   createdAt    DateTime          @default(now())
   updatedAt    DateTime          @updatedAt
 
-  scan      Scan              @relation(fields: [scanId], references: [id], onDelete: Restrict)
-  instances FindingInstance[]
+  scan            Scan                 @relation(fields: [scanId], references: [id], onDelete: Restrict)
+  instances       FindingInstance[]
+  /// Stage 6: the AI Security Analyst's per-finding assessment(s). At most
+  /// one per `(analysisId, findingId)` pair — see `FindingAssessment`.
+  assessments     FindingAssessment[]
+  /// Stage 6: correlations where this finding is named as the "A" side.
+  correlationsAsA FindingCorrelation[] @relation("FindingCorrelationA")
+  /// Stage 6: correlations where this finding is named as the "B" side.
+  correlationsAsB FindingCorrelation[] @relation("FindingCorrelationB")
 
   @@unique([scanId, source, sourceRuleId])
   @@index([scanId])
@@ -288,3 +298,208 @@ model FindingInstance {
   @@map("finding_instances")
 }
 
+// ---------------------------------------------------------------------------
+// Stage 6: AI Security Analyst.
+//
+// The AI is not the scanner and never makes network requests, crawls, or
+// executes anything against a target — it reasons over already-persisted
+// `Finding`/`FindingInstance` rows and produces a structured, validated
+// assessment. See `modules/analysis/` for the deterministic preprocessing,
+// provider abstraction, prompt, and Zod-validated output contract; nothing
+// here stores an AI provider's raw response or API credentials.
+// ---------------------------------------------------------------------------
+
+/// Lifecycle state of a `SecurityAnalysis`. Mirrors `ScanStatus`'s shape —
+/// `queued` → `running` → (`completed` | `failed`), both of the latter
+/// terminal — but is a separate enum because an analysis's lifecycle is
+/// conceptually independent of its scan's (a scan is always `completed`
+/// before an analysis can even be requested; see `SecurityAnalysis.scanId`).
+enum AnalysisStatus {
+  queued
+  running
+  completed
+  failed
+}
+
+/// The AI's overall risk verdict for the scan as a whole. Same five-level
+/// scale as `FindingSeverity`, kept as a distinct enum (not reused) so that a
+/// scanner-assigned severity and an AI-assigned risk/priority are never
+/// representationally conflated — see the `FindingAssessment.priority` doc
+/// comment for why this separation matters.
+enum OverallRisk {
+  critical
+  high
+  medium
+  low
+  informational
+}
+
+/// The AI's priority/urgency judgment for one finding (or for remediating
+/// it) — deliberately the same five-level scale as `FindingSeverity` but a
+/// distinct enum, never reused in place of it. `Finding.severity` is the
+/// scanner's own, unmodified verdict; `FindingAssessment.priority` (and
+/// `.remediationPriority`) are the AI's separate judgment, which may
+/// legitimately differ from the scanner severity when supporting evidence or
+/// correlation with other findings justifies it. The AI is never allowed to
+/// rewrite `Finding.severity` itself — only to add its own opinion alongside
+/// it, with reasoning.
+enum AssessmentPriority {
+  critical
+  high
+  medium
+  low
+  informational
+}
+
+/// How likely the AI judges a finding to be a false positive. Deliberately
+/// not a boolean and never used to delete or suppress a `Finding` — human
+/// review remains authoritative. `unknown` is the honest default when the
+/// supplied evidence doesn't support a judgment either way.
+enum FalsePositiveLikelihood {
+  low
+  medium
+  high
+  unknown
+}
+
+/// One AI-generated security analysis of a completed `Scan`'s findings.
+///
+/// **Uniqueness strategy (Stage 6 decision):** `scanId` is `@unique` — at
+/// most one `SecurityAnalysis` ever exists per scan in this stage, in any
+/// status. `AnalysisStatus` has no transition back out of `failed` (see that
+/// enum's doc comment), so a failed analysis is not retryable in place, and
+/// a completed one is never silently overwritten by a rerun — `POST
+/// /scans/:scanId/analyze` simply refuses with `409` once any row exists for
+/// that scan, regardless of its status. This is a deliberately conservative
+/// choice for Stage 6, not an oversight: real multi-version analysis
+/// (re-running with a new prompt/model while keeping prior results) is
+/// explicitly future work — see the README's "Analysis Re-runs" section —
+/// and would be introduced by relaxing this constraint to
+/// `@@unique([scanId, promptVersion])` or dropping it in favor of an
+/// explicit "current analysis" pointer, not by changing anything else about
+/// this model's shape.
+///
+/// **Delete behavior:** `scan` is `Restrict`, matching every other relation
+/// to `Scan` in this schema — an analysis is part of a scan's historical
+/// record, and `Scan` deletion isn't possible through any endpoint anyway.
+model SecurityAnalysis {
+  id                 String         @id @default(uuid())
+  scanId             String         @unique
+  status             AnalysisStatus @default(queued)
+  /// Which AI model produced this analysis (e.g. `"claude-sonnet-5"`), set
+  /// only once the analysis completes. Purely for auditability — never used
+  /// to branch application logic.
+  model              String?
+  /// Which version of the security-analysis system prompt produced this
+  /// analysis (see `modules/analysis/analysis-prompt.ts`). Set at creation,
+  /// before the model is ever called, so it is always present even if the
+  /// analysis later fails.
+  promptVersion      String
+  overallRisk        OverallRisk?
+  executiveSummary   String?
+  methodologySummary String?
+  /// Free text describing this analysis's own limitations (e.g. truncated
+  /// findings, low-confidence areas) — the AI's own caveats, not an error.
+  limitations        String?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+  completedAt        DateTime?
+  /// Set only on `failed`; a safe, never-raw-provider-error message — see
+  /// `modules/analysis/security-analysis-executor.ts`'s `safeMessage`.
+  errorMessage       String?
+
+  scan         Scan                 @relation(fields: [scanId], references: [id], onDelete: Restrict)
+  assessments  FindingAssessment[]
+  correlations FindingCorrelation[]
+
+  @@index([scanId])
+  @@index([status])
+  @@map("security_analyses")
+}
+
+/// The AI's structured assessment of one `Finding` within one
+/// `SecurityAnalysis`. See the `AssessmentPriority` doc comment for why
+/// `priority`/`remediationPriority` here are kept strictly separate from
+/// `Finding.severity` — the AI never rewrites the scanner's own verdict.
+///
+/// At most one assessment per `(analysisId, findingId)` — the AI assesses
+/// each finding once per analysis run, not multiple times.
+///
+/// **Delete behavior:** `analysis` cascades (a `FindingAssessment` has no
+/// meaning outside the `SecurityAnalysis` it belongs to); `finding` is
+/// `Restrict` (consistent with every other relation to `Finding` in this
+/// schema — `Finding` deletion isn't possible through any endpoint).
+model FindingAssessment {
+  id                      String                  @id @default(uuid())
+  analysisId              String
+  findingId               String
+  /// The AI's own priority judgment for this finding — see the
+  /// `AssessmentPriority` enum doc comment. Deliberately separate from
+  /// `Finding.severity`.
+  priority                AssessmentPriority
+  riskAssessment          String
+  /// The AI's confidence in its *own* assessment (not the scanner's
+  /// confidence in the finding itself, which lives unmodified on
+  /// `Finding.confidence`). Reuses `FindingConfidence` — same underlying
+  /// concept (confidence in a claim), applied by a different party.
+  confidence              FindingConfidence
+  reasoning               String
+  businessImpact          String?
+  technicalImpact         String?
+  /// How urgently this finding's remediation should be scheduled — may
+  /// differ from `priority` itself (e.g. a finding could be high-priority to
+  /// understand but lower-urgency to fix given a compensating control).
+  remediationPriority     AssessmentPriority
+  falsePositiveLikelihood FalsePositiveLikelihood
+  createdAt               DateTime                @default(now())
+  updatedAt               DateTime                @updatedAt
+
+  analysis SecurityAnalysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  finding  Finding          @relation(fields: [findingId], references: [id], onDelete: Restrict)
+
+  @@unique([analysisId, findingId])
+  @@index([analysisId])
+  @@index([findingId])
+  @@map("finding_assessments")
+}
+
+/// A relationship the AI identified between two findings within one
+/// `SecurityAnalysis` — e.g. two findings sharing a root cause, or one
+/// amplifying the risk of another. `relationship` is a closed, controlled
+/// list (`modules/analysis/analysis-enums.ts`'s `CORRELATION_RELATIONSHIPS`),
+/// validated at the application layer — a plain `String` column for the same
+/// reason `Finding.category` is (see that model's doc comment): some
+/// relationship values are hyphenated (`"attack-chain"`,
+/// `"shared-root-cause"`), which a Prisma enum value cannot represent. The
+/// AI is never free to invent an arbitrary relationship label.
+///
+/// `findingAId`/`findingBId` are canonicalized (lexicographically ordered)
+/// before persistence, so the same pair is never stored twice in reversed
+/// order — see `modules/analysis/security-analysis-executor.ts`.
+///
+/// **Delete behavior:** `analysis` cascades (same reasoning as
+/// `FindingAssessment`); both finding relations are `Restrict`.
+model FindingCorrelation {
+  id           String            @id @default(uuid())
+  analysisId   String
+  findingAId   String
+  findingBId   String
+  /// One of `CORRELATION_RELATIONSHIPS` — see this model's doc comment.
+  relationship String
+  /// The AI's confidence in this specific correlation claim. Deliberately
+  /// per-correlation, not inherited from either finding's own confidence —
+  /// a correlation is its own claim, evaluated on its own evidence.
+  confidence   FindingConfidence
+  explanation  String
+  createdAt    DateTime          @default(now())
+
+  analysis SecurityAnalysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  findingA Finding          @relation("FindingCorrelationA", fields: [findingAId], references: [id], onDelete: Restrict)
+  findingB Finding          @relation("FindingCorrelationB", fields: [findingBId], references: [id], onDelete: Restrict)
+
+  @@unique([analysisId, findingAId, findingBId])
+  @@index([analysisId])
+  @@index([findingAId])
+  @@index([findingBId])
+  @@map("finding_correlations")
+}

@@ -24,6 +24,13 @@ import type { FindingRepository } from "./repositories/finding.repository.js";
 import { defaultZapClient, type ZapClient } from "./lib/zap-client.js";
 import { ZapScanExecutor } from "./modules/scans/zap-scan-executor.js";
 import type { ScanExecutor } from "./modules/scans/scan-executor.js";
+import { analysisRoutes } from "./modules/analysis/analysis.routes.js";
+import { prismaAnalysisRepository } from "./repositories/prisma-analysis.repository.js";
+import type { AnalysisRepository } from "./repositories/analysis.repository.js";
+import { GeminiSecurityAnalysisModel } from "./modules/analysis/providers/gemini-security-analysis-model.js";
+import type { SecurityAnalysisModel } from "./modules/analysis/security-analysis-model.js";
+import { SecurityAnalysisExecutor } from "./modules/analysis/security-analysis-executor.js";
+import type { AnalysisExecutor } from "./modules/analysis/analysis-executor.js";
 
 export interface BuildAppOptions {
   /**
@@ -64,6 +71,23 @@ export interface BuildAppOptions {
    * mean an uncontrolled attempt to reach ZAP on every such test.
    */
   scanExecutor?: ScanExecutor;
+  /**
+   * Persistence boundary for AI security analyses. Defaults to the Prisma-backed repository.
+   */
+  analysisRepository?: AnalysisRepository;
+  /**
+   * The AI provider abstraction. Defaults to `GeminiSecurityAnalysisModel`
+   * pointed at `env.AI_MODEL`. Tests inject a fake implementation so
+   * the suite needs no real AI provider API key.
+   */
+  analysisModel?: SecurityAnalysisModel;
+  /**
+   * Runs queued analyses. Defaults to `SecurityAnalysisExecutor` wired to
+   * `analysisModel`/`analysisRepository`/`findingRepository`. Tests
+   * typically override this directly, the same reason `scanExecutor` is:
+   * `requestAnalysis` fires it in the background on every analysis request.
+   */
+  analysisExecutor?: AnalysisExecutor;
 }
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
@@ -75,6 +99,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     scanRepository = prismaScanRepository,
     findingRepository = prismaFindingRepository,
     zapClient = defaultZapClient,
+    analysisRepository = prismaAnalysisRepository,
   } = options;
 
   const scanExecutor =
@@ -84,6 +109,21 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       activeScanTimeoutMs: env.ZAP_ACTIVE_SCAN_TIMEOUT_MS,
       overallTimeoutMs: env.ZAP_OVERALL_SCAN_TIMEOUT_MS,
       pollIntervalMs: env.ZAP_POLL_INTERVAL_MS,
+    });
+
+  const analysisModel =
+    options.analysisModel ??
+    new GeminiSecurityAnalysisModel({
+      apiKey: env.GEMINI_API_KEY,
+      model: env.AI_MODEL,
+      timeoutMs: env.ANALYSIS_TIMEOUT_MS,
+      maxOutputTokens: env.ANALYSIS_MAX_OUTPUT_TOKENS,
+    });
+
+  const analysisExecutor =
+    options.analysisExecutor ??
+    new SecurityAnalysisExecutor(analysisModel, analysisRepository, findingRepository, {
+      modelName: env.AI_MODEL,
     });
 
   const app = fastify({
@@ -104,6 +144,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   app.decorate("findingRepository", findingRepository);
   app.decorate("zapClient", zapClient);
   app.decorate("scanExecutor", scanExecutor);
+  app.decorate("analysisRepository", analysisRepository);
+  app.decorate("analysisExecutor", analysisExecutor);
 
   app.register(authentication, { userRepository });
 
@@ -169,6 +211,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   app.register(targetRoutes, { prefix: "/targets" });
   app.register(scanRoutes, { prefix: "/scans" });
   app.register(findingRoutes, { prefix: "/findings" });
+  app.register(analysisRoutes, { prefix: "/analysis" });
 
   return app;
 }

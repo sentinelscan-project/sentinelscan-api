@@ -3,8 +3,10 @@ import { UnauthorizedError } from "../../lib/errors.js";
 import { parseOrThrow } from "../../lib/validation.js";
 import { toPublicScan } from "../../repositories/scan.repository.js";
 import { toPublicFinding } from "../../repositories/finding.repository.js";
+import { toPublicAnalysis } from "../../repositories/analysis.repository.js";
 import { listFindingsQuerySchema } from "../findings/finding.schemas.js";
 import { listFindingsForScan } from "../findings/finding.service.js";
+import { getAnalysisForScan, requestAnalysis } from "../analysis/analysis.service.js";
 import { listScansQuerySchema, scanIdParamsSchema } from "./scan.schemas.js";
 import { cancelScan, getScan, listScans } from "./scan.service.js";
 
@@ -87,5 +89,31 @@ export const scanRoutes: FastifyPluginAsync = async (fastify: FastifyInstance) =
       offset: query.offset,
       hasMore: result.hasMore,
     });
+  });
+
+  // Stage 6: AI Security Analyst. Both nested under their parent scan for
+  // the same reason `/:id/findings` above is — `:id` here is the scan id.
+  fastify.post("/:id/analyze", async (request, reply) => {
+    const ownerId = requireOwnerId(request);
+    const params = parseOrThrow(scanIdParamsSchema, request.params);
+    const analysis = await requestAnalysis(
+      fastify.scanRepository,
+      fastify.targetRepository,
+      fastify.analysisRepository,
+      fastify.analysisExecutor,
+      ownerId,
+      params.id,
+    );
+    // Freshly created (status "queued"): no assessments/correlations exist yet.
+    return reply
+      .status(202)
+      .send({ analysis: toPublicAnalysis({ ...analysis, assessments: [], correlations: [] }) });
+  });
+
+  fastify.get("/:id/analysis", async (request, reply) => {
+    const ownerId = requireOwnerId(request);
+    const params = parseOrThrow(scanIdParamsSchema, request.params);
+    const analysis = await getAnalysisForScan(fastify.scanRepository, fastify.analysisRepository, ownerId, params.id);
+    return reply.status(200).send({ analysis: toPublicAnalysis(analysis) });
   });
 };

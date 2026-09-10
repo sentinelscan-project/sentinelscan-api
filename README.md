@@ -1,9 +1,9 @@
 # SentinelScan API (`sentinelscan-api`)
 
 ## Overview
-`sentinelscan-api` is the backend API service for **SentinelScan**. Built with Fastify and TypeScript, it provides the core API foundation, environment configuration validation with Zod, PostgreSQL persistence using Prisma, identity and authentication, authorized target management, scan orchestration backed by a real OWASP ZAP integration, vendor-neutral finding normalization and persistence, centralized logging and error handling, and container packaging.
+`sentinelscan-api` is the backend API service for **SentinelScan**. Built with Fastify and TypeScript, it provides the core API foundation, environment configuration validation with Zod, PostgreSQL persistence using Prisma, identity and authentication, authorized target management, scan orchestration backed by a real OWASP ZAP integration, vendor-neutral finding normalization and persistence, an AI-assisted security analysis layer, centralized logging and error handling, and container packaging.
 
-> **Stage 5 Notice**: This repository currently implements the backend foundation (Stage 0), identity and authentication (Stage 1), target registration/management (Stage 2), scan orchestration (Stage 3), real OWASP ZAP execution (Stage 4), and **findings & vulnerability normalization (Stage 5)**. A completed scan now normalizes ZAP's raw alerts into SentinelScan's own vendor-neutral `Finding`/`FindingInstance` model and persists them to PostgreSQL before the scan is reported `completed` — see [Findings & Vulnerability Normalization](#findings--vulnerability-normalization) below for the normalization architecture, severity/confidence/category mapping, deduplication strategy, sanitization rules, persistence lifecycle, and the new `GET /scans/:scanId/findings` / `GET /findings/:id` endpoints. What Stage 5 deliberately does **not** do: no AI/LLM analysis of findings, no SentinelScan-native discovery engine or scanner (ZAP remains the only scan engine), no automated remediation. `User`, `Target`, `Scan`, `Finding` and `FindingInstance` are the only domain models; a later stage will attach AI analyses and reports.
+> **Stage 6 & 7 Notice**: This repository currently implements the backend foundation (Stage 0), identity and authentication (Stage 1), target registration/management (Stage 2), scan orchestration (Stage 3), real OWASP ZAP execution (Stage 4), findings & vulnerability normalization (Stage 5), and **the AI Security Analyst (Stage 6 & 7)**. A completed scan's persisted findings can now be sent to an AI provider (Google Gemini) for structured, validated security analysis — correlation, prioritization, false-positive likelihood, and remediation guidance — persisted as `SecurityAnalysis`/`FindingAssessment`/`FindingCorrelation` rows. See [AI Security Analyst](#ai-security-analyst) below for the full architecture, and read its "What This Is Not" subsection first: **AI analysis is advisory only** — it never replaces the scanner, never proves exploitability beyond what the supplied evidence shows, and never independently verifies a vulnerability; the original scanner findings remain the source of truth. What Stage 6 & 7 deliberately do **not** do: no autonomous agents, no vector database or embeddings, no cross-scan memory, no SentinelScan-native discovery engine or scanner, no automated remediation execution. `User`, `Target`, `Scan`, `Finding`, `FindingInstance`, `SecurityAnalysis`, `FindingAssessment` and `FindingCorrelation` are the only domain models.
 
 ---
 
@@ -18,6 +18,7 @@
 - **OAuth / OIDC**: `@fastify/oauth2` + `google-auth-library`
 - **Security Scanning Engine**: OWASP ZAP daemon (`ghcr.io/zaproxy/zaproxy`), driven via its JSON HTTP API — no ZAP client SDK dependency, just native `fetch`
 - **IP range classification (SSRF policy)**: `ipaddr.js`
+- **AI Security Analysis**: Google Gemini via `@google/genai` (structured JSON output via responseSchema), behind a provider-neutral `SecurityAnalysisModel` interface
 - **Testing**: Vitest
 - **Linting**: ESLint
 - **Containerization**: Docker (multi-stage)
@@ -30,7 +31,7 @@
 sentinelscan-api/
 ├── prisma/
 │   ├── migrations/           # Versioned SQL migrations
-│   └── schema.prisma         # Datasource, generator, User, Target, Scan, Finding and FindingInstance models
+│   └── schema.prisma         # Datasource, generator, and every domain model through Stage 6
 ├── src/
 │   ├── app.ts                # Fastify app factory with middleware & error handling
 │   ├── config.ts             # Zod environment validation & startup check
@@ -75,6 +76,20 @@ sentinelscan-api/
 │   │           ├── zap-confidence-mapping.ts   # ZAP confidence → FindingConfidence (centralized, documented fallback)
 │   │           ├── zap-category-mapping.ts     # ZAP pluginId → FindingCategory (centralized, documented fallback)
 │   │           └── zap-alert-normalizer.ts     # ZapRawAlert[] → NormalizedFinding[] (grouping, dedup, sanitization)
+│   │   └── analysis/
+│   │       ├── analysis-enums.ts             # AnalysisStatus/OverallRisk/AssessmentPriority/... closed lists
+│   │       ├── security-analysis-input.ts    # Deterministic, provider-neutral SecurityAnalysisInput contract
+│   │       ├── analysis-preprocessing.ts     # Loads/sorts/bounds/re-sanitizes findings into that input (Stage 6 §8–9)
+│   │       ├── security-analysis-output.schema.ts # Zod contract every provider's output must satisfy
+│   │       ├── security-analysis-model.ts    # SecurityAnalysisModel provider interface + AiProviderError
+│   │       ├── analysis-prompt.ts            # Versioned system prompt (SECURITY_ANALYSIS_PROMPT_VERSION)
+│   │       ├── analysis-executor.ts          # AnalysisExecutor interface (mirrors scan-executor.ts)
+│   │       ├── security-analysis-executor.ts # Real executor: input → model → validate → persist → terminal state
+│   │       ├── analysis.schemas.ts           # Zod request schemas
+│   │       ├── analysis.service.ts           # Lifecycle state machine, ownership-enforced operations
+│   │       ├── analysis.routes.ts            # GET /analysis/:id
+│   │       └── providers/
+│   │           └── gemini-security-analysis-model.ts # The implemented provider (Google Gemini, responseSchema)
 │   ├── plugins/
 │   │   └── authentication.ts # JWT + cookie session, `authenticate` preHandler
 │   ├── repositories/
@@ -86,7 +101,9 @@ sentinelscan-api/
 │   │   ├── scan.repository.ts          # ScanRepository interface & PublicScan
 │   │   ├── prisma-scan.repository.ts   # Prisma implementation (atomic CAS transitions)
 │   │   ├── finding.repository.ts       # FindingRepository interface & PublicFinding
-│   │   └── prisma-finding.repository.ts # Prisma implementation (transaction-wrapped createMany)
+│   │   ├── prisma-finding.repository.ts # Prisma implementation (transaction-wrapped createMany)
+│   │   ├── analysis.repository.ts      # AnalysisRepository interface & PublicSecurityAnalysis
+│   │   └── prisma-analysis.repository.ts # Prisma implementation (transaction-wrapped completeAnalysis)
 │   ├── routes/
 │   │   └── health.ts         # GET /health, GET /health/zap
 │   └── types/
@@ -97,18 +114,25 @@ sentinelscan-api/
 │   │   ├── in-memory-target.repository.ts # Database-free TargetRepository for tests
 │   │   ├── in-memory-scan.repository.ts   # Database-free ScanRepository (reproduces CAS semantics)
 │   │   ├── in-memory-finding.repository.ts # Database-free FindingRepository (reproduces transaction/failure semantics)
+│   │   ├── in-memory-analysis.repository.ts # Database-free AnalysisRepository (reproduces CAS/transaction semantics)
 │   │   ├── fake-zap-client.ts             # Scriptable ZapClient test double (no real HTTP)
-│   │   └── fake-scan-executor.ts          # No-op ScanExecutor so orchestration tests don't touch ZAP
+│   │   ├── fake-scan-executor.ts          # No-op ScanExecutor so orchestration tests don't touch ZAP
+│   │   ├── fake-security-analysis-model.ts # Scriptable SecurityAnalysisModel test double (no real AI provider)
+│   │   └── fake-analysis-executor.ts      # No-op AnalysisExecutor so orchestration tests don't touch the AI provider
 │   ├── auth.test.ts              # Registration, verification, login, session, logout tests
 │   ├── google-auth.test.ts       # Google identity & unconfigured-provider tests
 │   ├── targets.test.ts           # Target CRUD, ownership isolation, validation tests
 │   ├── scans.test.ts             # Scan orchestration, lifecycle, ownership isolation tests
 │   ├── findings.test.ts          # Findings API: filtering, counts, pagination, ownership isolation
+│   ├── analysis.test.ts          # Analysis API: lifecycle, authorization, duplicate-prevention
 │   ├── target-safety.test.ts     # SSRF policy: IP ranges, DNS resolution, DNS-rebinding awareness
 │   ├── zap-client.test.ts        # HttpZapClient against a mocked fetch
 │   ├── zap-scan-executor.test.ts # Full execution lifecycle incl. finding persistence, against a fake ZapClient
 │   ├── zap-alert-normalizer.test.ts # Severity/confidence/category mapping, grouping, dedup, sanitization
 │   ├── sanitize-text.test.ts     # Credential redaction & length-capping rules
+│   ├── analysis-preprocessing.test.ts # Deterministic input building: ordering, limits, re-sanitization
+│   ├── security-analysis-executor.test.ts # Full analysis execution lifecycle against a fake model
+│   ├── gemini-security-analysis-model.test.ts # Provider adapter against a mocked Gemini client
 │   └── health.test.ts            # /health and /health/zap tests
 ├── .dockerignore
 ├── .env.example
@@ -160,6 +184,11 @@ cp .env.example .env
 | `ZAP_ACTIVE_SCAN_TIMEOUT_MS` | Ceiling on the active-scan phase | `1800000` (30 min) |
 | `ZAP_OVERALL_SCAN_TIMEOUT_MS` | Ceiling across the whole execution, independent of the two phase timeouts | `2400000` (40 min) |
 | `ZAP_POLL_INTERVAL_MS` | How often the executor polls ZAP for spider/active-scan progress | `2000` |
+| `AI_PROVIDER` | AI Security Analyst provider | `gemini` |
+| `AI_MODEL` | Which Gemini model performs security analysis | `gemini-2.5-flash` |
+| `GEMINI_API_KEY` | Google Gemini API key *(optional — see [AI Security Analyst](#ai-security-analyst) for what happens without one)* | *(unset)* |
+| `ANALYSIS_TIMEOUT_MS` | Per-analysis timeout for the AI provider call itself | `120000` (2 min) |
+| `ANALYSIS_MAX_OUTPUT_TOKENS` | Ceiling on the model's own output size for one analysis | `8000` |
 
 Generate a signing key with:
 
@@ -324,9 +353,66 @@ One location where a `Finding`'s rule was actually observed — a specific URL, 
 
 Indexed on `findingId`. **Delete behavior**: `Cascade` — a `FindingInstance` has no independent identity or historical significance apart from the `Finding` it belongs to, unlike `Finding` itself relative to `Scan`.
 
-Later stages will hang `AiAnalysis → Report` off `Scan`/`Finding`; neither model exists yet.
+### `SecurityAnalysis` (table `security_analyses`)
 
-Persistence for all five models is reached through a repository interface (`UserRepository`, `TargetRepository`, `ScanRepository`, `FindingRepository`) rather than Prisma directly, so route handlers stay database-agnostic and the test suite can run against an in-memory implementation with no PostgreSQL instance. `ScanRepository`'s status-transition method is a compare-and-swap (`UPDATE ... WHERE status = $expected`, via Prisma's `updateMany`), which is what makes two simultaneous requests to cancel (or otherwise transition) the same scan resolve safely — see [Scan lifecycle](#scan-lifecycle). `FindingRepository.createMany` wraps every `Finding`/`FindingInstance` write for one scan in a single Prisma `$transaction` — see [Persistence Lifecycle](#persistence-lifecycle--transaction-behavior).
+One AI-generated security analysis of a completed `Scan`'s findings — see [AI Security Analyst](#ai-security-analyst) for the full architecture.
+
+| Column | Type | Notes |
+| :--- | :--- | :--- |
+| `id` | `String` (uuid) | Primary key |
+| `scanId` | `String` | Foreign key to `Scan.id`, `onDelete: Restrict`, **`@unique`** — see the uniqueness-strategy note below |
+| `status` | `AnalysisStatus` | `"queued"` (default) · `"running"` · `"completed"` · `"failed"` |
+| `model` | `String?` | Which AI model produced this analysis (e.g. `"claude-sonnet-5"`); set only once completed |
+| `promptVersion` | `String` | Which version of the system prompt produced this analysis; set at creation |
+| `overallRisk` | `OverallRisk?` | `critical` \| `high` \| `medium` \| `low` \| `informational`; set only once completed |
+| `executiveSummary` | `String?` | Set only once completed |
+| `methodologySummary` | `String?` | The AI's own description of its approach, when provided |
+| `limitations` | `String?` | The AI's own caveats about this analysis (e.g. truncated findings) |
+| `createdAt` / `updatedAt` | `DateTime` | Standard timestamps |
+| `completedAt` | `DateTime?` | Set on `completed` or `failed` |
+| `errorMessage` | `String?` | Set only on `failed`; a safe, never-raw-provider-error message |
+
+**Uniqueness strategy (Stage 6 decision):** `scanId` is `@unique` — at most one `SecurityAnalysis` ever exists per scan in this stage, in any status. `AnalysisStatus` has no transition back out of `failed`, so a failed analysis is not retryable in place, and a completed one is never silently overwritten by a rerun: `POST /scans/:scanId/analyze` simply refuses with `409 ANALYSIS_ALREADY_EXISTS` once any row exists for that scan. See [Analysis Re-runs](#analysis-re-runs) for why this is deliberate, not an oversight, and what relaxing it later would look like.
+
+### `FindingAssessment` (table `finding_assessments`)
+
+The AI's structured assessment of one `Finding` within one `SecurityAnalysis`.
+
+| Column | Type | Notes |
+| :--- | :--- | :--- |
+| `id` | `String` (uuid) | Primary key |
+| `analysisId` | `String` | Foreign key to `SecurityAnalysis.id`, `onDelete: Cascade` |
+| `findingId` | `String` | Foreign key to `Finding.id`, `onDelete: Restrict` |
+| `priority` | `AssessmentPriority` | The AI's own priority judgment — **never** `Finding.severity` itself; see [Prioritization Logic](#prioritization-logic) |
+| `riskAssessment` | `String` | The AI's explanation of the risk this finding poses |
+| `confidence` | `FindingConfidence` | The AI's confidence in its *own* assessment (reuses the same scale `Finding.confidence` uses) |
+| `reasoning` | `String` | Why the AI reached this priority/assessment — required whenever `priority` differs from `Finding.severity` |
+| `businessImpact` / `technicalImpact` | `String?` | Optional, more specific impact framing |
+| `remediationPriority` | `AssessmentPriority` | How urgently this finding's remediation should be scheduled — may differ from `priority` itself |
+| `falsePositiveLikelihood` | `FalsePositiveLikelihood` | `low` \| `medium` \| `high` \| `unknown` — never used to delete or suppress a finding |
+| `createdAt` / `updatedAt` | `DateTime` | Standard timestamps |
+
+At most one assessment per `(analysisId, findingId)` — `@@unique([analysisId, findingId])`. **Delete behavior**: `analysis` cascades; `finding` is `Restrict` (consistent with every other relation to `Finding`).
+
+### `FindingCorrelation` (table `finding_correlations`)
+
+A relationship the AI identified between two findings within one `SecurityAnalysis`.
+
+| Column | Type | Notes |
+| :--- | :--- | :--- |
+| `id` | `String` (uuid) | Primary key |
+| `analysisId` | `String` | Foreign key to `SecurityAnalysis.id`, `onDelete: Cascade` |
+| `findingAId` / `findingBId` | `String` | Foreign keys to `Finding.id`, both `onDelete: Restrict`; canonicalized to lexicographic order before persistence, so the same pair is never stored twice reversed |
+| `relationship` | `String` | One of `CORRELATION_RELATIONSHIPS` (`related`, `duplicate-symptom`, `attack-chain`, `shared-root-cause`, `amplifies-risk`) — a closed, application-validated list, the same reasoning as `Finding.category` (some values are hyphenated) |
+| `confidence` | `FindingConfidence` | The AI's confidence in this specific correlation claim |
+| `explanation` | `String` | Grounded in the supplied evidence — see [Correlation Logic](#correlation-logic) |
+| `createdAt` | `DateTime` | Standard timestamp |
+
+At most one row per `(analysisId, findingAId, findingBId)` — `@@unique`. **Delete behavior**: `analysis` cascades; both finding relations are `Restrict`.
+
+Later stages will hang `Report` off `Scan`/`SecurityAnalysis`; that model does not exist yet.
+
+Persistence for all eight models is reached through a repository interface (`UserRepository`, `TargetRepository`, `ScanRepository`, `FindingRepository`, `AnalysisRepository`) rather than Prisma directly, so route handlers stay database-agnostic and the test suite can run against an in-memory implementation with no PostgreSQL instance. `ScanRepository`'s status-transition method is a compare-and-swap (`UPDATE ... WHERE status = $expected`, via Prisma's `updateMany`), which is what makes two simultaneous requests to cancel (or otherwise transition) the same scan resolve safely — see [Scan lifecycle](#scan-lifecycle). `FindingRepository.createMany` wraps every `Finding`/`FindingInstance` write for one scan in a single Prisma `$transaction` — see [Persistence Lifecycle](#persistence-lifecycle--transaction-behavior). `AnalysisRepository.completeAnalysis` does the same for every `FindingAssessment`/`FindingCorrelation` write, guarded by the same CAS pattern — see [AI Security Analyst → Persistence & Transactions](#persistence--transactions).
 
 ---
 
@@ -702,6 +788,78 @@ A single finding with its instances — only when it belongs to a scan the calle
 
 No raw ZAP response, no internal Prisma field, and no secret ever crosses this boundary — see [Sanitization](#sanitization).
 
+### AI Security Analysis
+
+Every route requires authentication. See [AI Security Analyst](#ai-security-analyst) for the full architecture behind these endpoints — the analysis lifecycle, provider abstraction, structured output contract, and why AI analysis is advisory only.
+
+#### `POST /scans/:scanId/analyze`
+
+Requests a new AI security analysis of a completed scan the caller owns. Creates a `SecurityAnalysis` row (`status: "queued"`) and returns immediately — analysis runs in the background, the same fire-and-forget shape scan execution itself uses (see [Asynchronous Execution](#asynchronous-execution)).
+
+- `202` — `{ "analysis": { ... } }`, `status: "queued"`
+- `400` `VALIDATION_ERROR` — `:scanId` is not a well-formed UUID
+- `401` `UNAUTHORIZED` — no valid session
+- `404` `SCAN_NOT_FOUND` — no such scan, *or* it was requested by a different user
+- `409` `SCAN_NOT_COMPLETED` — the scan exists but hasn't finished (`status` isn't `"completed"`)
+- `409` `ANALYSIS_ALREADY_EXISTS` — an analysis already exists for this scan (any status) — see [Analysis Re-runs](#analysis-re-runs) and [Concurrency & Duplicate Prevention](#concurrency--duplicate-prevention)
+
+#### `GET /scans/:scanId/analysis`
+
+The current analysis for one scan the caller owns.
+
+- `200` — `{ "analysis": { ... } }`
+- `401` `UNAUTHORIZED` — no valid session
+- `404` `SCAN_NOT_FOUND` — no such scan, *or* it was requested by a different user
+- `404` `ANALYSIS_NOT_FOUND` — the scan exists and is owned by the caller, but no analysis has been requested for it yet (a legitimate, common state — this is a singular sub-resource, so its absence is reported as `404`, not an empty list)
+
+#### `GET /analysis/:id`
+
+A single analysis by id — only when it belongs to a scan the caller owns.
+
+- `200` — `{ "analysis": { ... } }`
+- `400` `VALIDATION_ERROR` — `:id` is not a well-formed UUID
+- `401` `UNAUTHORIZED` — no valid session
+- `404` `ANALYSIS_NOT_FOUND` — no such analysis, *or* its scan belongs to a different user
+
+#### Safe analysis representation
+
+```json
+{
+  "id": "d4e5...",
+  "scanId": "9c2a...",
+  "status": "completed",
+  "model": "claude-sonnet-5",
+  "promptVersion": "1.0",
+  "overallRisk": "high",
+  "executiveSummary": "One high-severity, exploitable reflected XSS finding was identified on the search endpoint...",
+  "methodologySummary": "Findings were reviewed for evidence quality, correlated by affected endpoint, and prioritized by combined impact.",
+  "limitations": null,
+  "createdAt": "2026-09-13T09:00:00.000Z",
+  "updatedAt": "2026-09-13T09:00:12.000Z",
+  "completedAt": "2026-09-13T09:00:12.000Z",
+  "errorMessage": null,
+  "assessments": [
+    {
+      "id": "e6f7...",
+      "findingId": "a1b2...",
+      "priority": "high",
+      "riskAssessment": "Exploitable reflected XSS on a search endpoint that echoes user input without encoding.",
+      "confidence": "high",
+      "reasoning": "The supplied evidence directly demonstrates script reflection in the response body.",
+      "businessImpact": "Could be used to hijack an authenticated user's session on this page.",
+      "technicalImpact": "Arbitrary script execution in the victim's browser context.",
+      "remediationPriority": "high",
+      "falsePositiveLikelihood": "low",
+      "createdAt": "2026-09-13T09:00:12.000Z",
+      "updatedAt": "2026-09-13T09:00:12.000Z"
+    }
+  ],
+  "correlations": []
+}
+```
+
+No raw provider response, no API key, no internal prompt (unless a future stage explicitly decides to expose one), and no internal Prisma field ever crosses this boundary.
+
 ### Error format
 
 ```json
@@ -873,7 +1031,159 @@ A `Scan` now reaches `completed` only once **both** of these have happened: the 
 
 ### What is not implemented
 
-No AI/LLM analysis of findings, no embeddings or vector database, no automated remediation, no endpoint-discovery engine, no SentinelScan-native vulnerability scanner. ZAP remains the only scan/finding source; the normalized model above is what makes adding a second source later a matter of writing one more adapter, not a schema change.
+No endpoint-discovery engine, no SentinelScan-native vulnerability scanner. ZAP remains the only scan/finding source; the normalized model above is what makes adding a second source later a matter of writing one more adapter, not a schema change. AI analysis of these findings is Stage 6's job — see [AI Security Analyst](#ai-security-analyst) below.
+
+---
+
+## AI Security Analyst
+
+**Stage 6 adds AI-assisted analysis on top of Stage 5's normalized findings.** The AI is not the scanner: it never makes network requests, crawls, executes code, or takes any action against a target. It receives already-collected, already-persisted `Finding`/`FindingInstance` rows and produces a structured, independently-validated security assessment.
+
+```
+Finding rows (Stage 5)
+  → deterministic preprocessing (sort, bound, re-sanitize)
+  → SecurityAnalysisInput
+  → SecurityAnalysisModel (provider adapter)
+  → SecurityAnalysisOutput (schema-validated)
+  → id cross-reference check
+  → transactional persistence
+  → SecurityAnalysis + FindingAssessment + FindingCorrelation rows
+```
+
+### What this is not
+
+SentinelScan does not become `ZAP → LLM → rewritten ZAP report`. The AI adds reasoning that cannot be obtained by simply displaying the scanner findings — correlating related findings, prioritizing remediation, explaining likely impact, flagging possible false positives with explicit uncertainty — but it never invents a vulnerability, an affected endpoint, or evidence that wasn't already in the supplied findings.
+
+**AI analysis is advisory.** It does not replace the scanner: `Finding.severity`/`Finding.confidence` are never altered by an analysis, ever (see [Prioritization Logic](#prioritization-logic)). It does not prove exploitability beyond what the supplied evidence already shows — an analysis may describe something as *potentially* exploitable, never assert exploitation occurred unless the evidence itself proves it. It does not independently verify a vulnerability: a possible-false-positive judgment is exactly that, a judgment with a stated likelihood, never an automatic deletion or suppression of the underlying `Finding`. The original scanner findings remain the source of truth; a `SecurityAnalysis` is an opinion layered on top of them, not a replacement for them.
+
+### Architecture: provider abstraction
+
+```
+AnalysisService → SecurityAnalysisExecutor → SecurityAnalysisModel → provider adapter → AI provider
+```
+
+- **`SecurityAnalysisModel`** (`modules/analysis/security-analysis-model.ts`) is the provider-neutral interface — one method, `analyzeSecurityFindings(input) → SecurityAnalysisOutput`. Nothing outside a concrete provider adapter constructs a provider API request or parses a provider response body, mirroring `ZapClient`'s role for ZAP.
+- **`GeminiSecurityAnalysisModel`** (`modules/analysis/providers/gemini-security-analysis-model.ts`) is the initial implemented provider: Google Gemini via `@google/genai`. A future second provider would be a new class implementing the same interface — no change required anywhere else in the codebase. The abstraction exists so adding or swapping providers doesn't require touching `AnalysisService`, the executor, the prompt, or the output schema.
+- **`SecurityAnalysisExecutor`** (`modules/analysis/security-analysis-executor.ts`) is the real executor: `queued` → deterministic input → model call → schema + id-reference validation → transactional persistence → terminal state, calling `analysis.service.ts`'s existing atomic lifecycle functions (`startAnalysis`/`completeAnalysis`/`failAnalysis`) at each step — it never writes `SecurityAnalysis.status` directly.
+
+Unlike `ZapScanExecutor`, there is no concurrency-limiting mutex: an AI provider call has no shared mutable daemon state to serialize around (each call is an independent HTTP request), so analyses for *different* scans may run concurrently without restriction. Duplicate analysis of the *same* scan is prevented earlier, at creation time — see [Concurrency & Duplicate Prevention](#concurrency--duplicate-prevention).
+
+### AI provider configuration
+
+Server-side environment variables only (see [Environment Variables](#supported-variables)) — `GEMINI_API_KEY` is never exposed to the browser (there is no `NEXT_PUBLIC_*` equivalent anywhere in this codebase) and never logged. `GEMINI_API_KEY` is deliberately optional: the API still boots and every other feature keeps working without it. A `POST /scans/:scanId/analyze` request made without one is accepted (the `SecurityAnalysis` row is created, `202`), but the analysis itself finishes `failed` with a safe, generic error message the first time the executor actually calls the provider — exactly the same failure path as a real provider outage, no special-casing. `AI_PROVIDER`, `AI_MODEL`, `ANALYSIS_TIMEOUT_MS`, and `ANALYSIS_MAX_OUTPUT_TOKENS` round out the configuration (provider selection, model selection, provider-call timeout, output size ceiling).
+
+### Structured output contract — never free-form text
+
+The AI's free-form reasoning is never trusted or stored directly. `securityAnalysisOutputSchema` (`modules/analysis/security-analysis-output.schema.ts`, Zod) is the actual gate every provider's output must pass before anything is persisted:
+
+```
+{
+  overallRisk, executiveSummary, methodologySummary?,
+  keyRisks: string[],
+  findingAssessments: [{ findingId, priority, riskAssessment, confidence, reasoning,
+                          businessImpact?, technicalImpact?, remediationPriority,
+                          falsePositiveLikelihood }],
+  correlations: [{ findingAId, findingBId, relationship, confidence, explanation }],
+  remediationPriorities: string[],
+  limitations: string[],
+}
+```
+
+`GeminiSecurityAnalysisModel` gets Gemini to emit this shape via **structured schema generation** (`responseMimeType: "application/json"` with `responseSchema` constrained to the analysis schema) — and the response is validated against `securityAnalysisOutputSchema` independently before persistence. If the response is malformed, has an invalid enum value, or is missing a required field, the schema rejects it and the whole analysis is marked `failed` — never partially persisted.
+
+**Referential integrity beyond the schema:** every `findingId`/`findingAId`/`findingBId` in the output must be one of the ids actually present in that analysis's `SecurityAnalysisInput` — checked separately, after schema validation, by `assertKnownFindingIds` (`security-analysis-executor.ts`). An id the schema itself can't catch (a syntactically valid UUID that simply wasn't supplied) is treated as the AI having invented a reference, and rejects the analysis the same way a schema failure does.
+
+### AI input contract — deterministic and sanitized
+
+`SecurityAnalysisInput` (`modules/analysis/security-analysis-input.ts`) is built once per analysis, by `buildSecurityAnalysisInput` (`analysis-preprocessing.ts`), from already-persisted findings — never assembled ad hoc:
+
+```
+{
+  scan: { id, targetName, targetOrigin },
+  findingCounts: { critical, high, medium, low, informational, total },
+  findings: [{ id, title, description, severity, confidence, category, cweId, wascId,
+               remediation, references, instances: [{ url, method, parameter, attack, evidence }] }],
+  truncatedFindingsCount,
+}
+```
+
+Never sent: passwords, cookies, Authorization headers, API keys, session tokens, database credentials, unrelated user data, or raw ZAP API credentials — none of these ever exist on a `Finding`/`FindingInstance` row to begin with (see [Sanitization](#sanitization) in the Findings section), and every text field is sanitized a **second** time here regardless (defense in depth — "deterministic preprocessing" means the AI input is never simply whatever is in the database right now with no independent bound of its own). `findingCounts` is computed by the application from the persisted `Finding` table, never left for the AI to (re)count.
+
+Deterministic preprocessing, in order: load findings for the scan (ownership already verified by `analysis.service.ts` before this ever runs) → re-sanitize every text field (`lib/sanitize-text.ts`, the same redaction rules Stage 5 uses) → sort findings by severity (highest first), tie-broken by `id` for full determinism (`createdAt` is not used for the primary sort — Stage 5 persists every finding for a scan in one transaction, so rows from the same scan commonly share an identical `createdAt`, which would make ordering by it effectively unstable) → bound the finding/instance counts and every string length → report how many findings were truncated, if any.
+
+### Input size / token safety — explicit, documented limits
+
+| Limit | Value |
+| :--- | :--- |
+| Findings per analysis | 40 (highest severity kept first; `truncatedFindingsCount` reports the rest) |
+| Instances per finding | 5 |
+| Title length | 300 chars |
+| Description length | 1,500 chars |
+| Remediation length | 1,500 chars |
+| URL length | 1,000 chars |
+| Parameter length | 200 chars |
+| Attack payload length | 500 chars |
+| Evidence length | 500 chars |
+| References per finding | 10, 300 chars each |
+
+Every cap uses `lib/sanitize-text.ts`'s redact-then-truncate ordering: redaction always runs *before* length-capping, so a would-be-secret sitting right at the truncation boundary is still fully redacted rather than half-truncated into something that looks safe but isn't (the same rule Stage 5 documents in [Sanitization](#sanitization)).
+
+### Prompt versioning
+
+`SECURITY_ANALYSIS_PROMPT_VERSION` (`modules/analysis/analysis-prompt.ts`, currently `"1.0"`) is recorded on every `SecurityAnalysis` row at creation time — before the model is ever called, so it's always present even if the analysis later fails. Bumping the prompt's meaning should always bump this string, so a later prompt change never silently reinterprets what an older, already-completed analysis actually reasoned from.
+
+The system prompt establishes: reason only from supplied evidence; every finding/correlation id must be copied exactly from the input, never invented; never claim exploitation occurred unless the evidence proves it; never claim an `attack-chain` relationship unless the evidence for both findings actually supports it (prefer `related` with an explanation when uncertain); the scanner's own severity/confidence are fixed facts the model never restates or contradicts; a possible false positive is reported as a likelihood with reasoning, never asserted as fact; remediation must be specific and actionable, not generic.
+
+### Prioritization logic
+
+`FindingAssessment.priority` (and `.remediationPriority`) are **deliberately separate columns from `Finding.severity`**, and no code path anywhere ever writes one from the other. The AI may rank a finding's priority above or below its scanner-assigned severity when the supplied evidence or its correlation with other findings justifies that — e.g. a `medium`-severity header finding whose priority is elevated to `high` because it combines with another finding to expose a sensitive workflow — but `Finding.severity` itself never changes, and the prompt requires `reasoning` to explain any such divergence. A frontend (a later stage) is expected to display both values side by side, never one in place of the other.
+
+### False-positive handling
+
+`FindingAssessment.falsePositiveLikelihood` (`low`/`medium`/`high`/`unknown`) is a likelihood judgment with accompanying `reasoning`/`riskAssessment` text — never a verdict, and never wired to delete, hide, or otherwise suppress the underlying `Finding` or `FindingInstance` anywhere in this codebase. Human review remains authoritative; nothing in Stage 6 automates acting on a false-positive judgment.
+
+### Correlation logic
+
+`FindingCorrelation.relationship` is a closed, controlled list (`CORRELATION_RELATIONSHIPS` in `modules/analysis/analysis-enums.ts`): `related`, `duplicate-symptom`, `attack-chain`, `shared-root-cause`, `amplifies-risk` — the AI can never invent an arbitrary relationship label; an output using any other string fails schema validation. Every correlation must include both participating finding ids, a relationship type, a confidence level, and a concrete `explanation` grounded in the supplied evidence — the prompt explicitly instructs the model to prefer `related` with a hedged explanation over an unsupported `attack-chain` claim. Correlation pairs are canonicalized to lexicographic `(findingAId, findingBId)` order and deduplicated before persistence (`canonicalizeCorrelations`, `security-analysis-executor.ts`), so the model reporting the same pair twice (or in reversed order) never produces two rows.
+
+### Persistence & transactions
+
+`SecurityAnalysis` reaches `completed` only once the model's output has been schema-validated **and** every id it references has been confirmed to exist in the input — never before. `AnalysisRepository.completeAnalysis` wraps the `running → completed` compare-and-swap update together with every `FindingAssessment`/`FindingCorrelation` insert in one Prisma `$transaction`: either the whole result lands, or none of it does. This transaction is never held open during the AI provider call itself — it covers only the short persistence/finalization phase, after the model has already responded and been validated. If persistence fails for any reason (a rolled-back transaction, an unexpected constraint violation), the analysis is reported `failed` with a safe message, never presented as a successful analysis with some of its assessments or correlations silently missing.
+
+### Analysis lifecycle
+
+```
+queued ──> running ──┬──> completed
+                      └──> failed
+```
+
+| From | May transition to |
+| :--- | :--- |
+| `queued` | `running` |
+| `running` | `completed`, `failed` |
+| `completed` / `failed` | *(terminal — nothing)* |
+
+Both `completed` and `failed` are terminal — there is no transition back out of `failed`. That is a deliberate consequence of the uniqueness strategy below, not a separate decision: since a scan may have at most one `SecurityAnalysis` row, a failed analysis simply cannot be retried in place within Stage 6.
+
+### Asynchronous execution
+
+`POST /scans/:scanId/analyze` creates the `SecurityAnalysis` row and returns `202` immediately — it does not wait for the AI provider call to finish. `analysis.service.ts`'s `requestAnalysis` fires `analysisExecutor.execute(...)` in the background (`void executor.execute(...).catch(...)`), the identical fire-and-forget shape `scan.service.ts`'s `createScan` uses for `ZapScanExecutor`. A real provider call can take tens of seconds; the HTTP request must not block for that.
+
+### Concurrency & duplicate prevention
+
+Stage 6 does not add rate-limiting infrastructure — that is documented here as explicit future production hardening, not implemented yet. What Stage 6 *does* prevent is an **accidental duplicate concurrent analysis job for the same scan**: `SecurityAnalysis.scanId` carries a real database `@unique` constraint, and `requestAnalysis` attempts `AnalysisRepository.create` directly rather than a separate check-then-create step — a unique-constraint violation (P2002) is translated into a clean `409 ANALYSIS_ALREADY_EXISTS`. This is what makes two concurrent `POST /scans/:scanId/analyze` requests for the same scan resolve safely: exactly one `create` call can ever succeed, at the database level, regardless of request timing.
+
+### Analysis re-runs
+
+**Stage 6 decision: at most one `SecurityAnalysis` per scan, full stop.** `POST /scans/:scanId/analyze` refuses with `409 ANALYSIS_ALREADY_EXISTS` once any row exists for a scan, in any status — including `failed`. This is deliberately conservative, not an oversight: real multi-version analysis (re-running with a new prompt version or model while keeping prior results, the way a scan's own history is kept) is explicit future work. Introducing it later means relaxing `SecurityAnalysis.scanId`'s constraint (e.g. to `@@unique([scanId, promptVersion])`) or introducing an explicit "current analysis" pointer alongside a full history table — not changing anything else about this model's shape or the analysis pipeline itself. A completed analysis is therefore never silently overwritten by a rerun today, and a failed one is not automatically retryable in place; recovering from a failed analysis in Stage 6 requires operator intervention (e.g. deleting the row), which is intentionally out of scope for the HTTP API itself.
+
+### Auditability
+
+Every `SecurityAnalysis` row records `model`, `promptVersion`, `createdAt`, `scanId`, and `status` — enough to understand how an analysis was produced without storing anything sensitive. No API key, no provider request/response body, and no raw prompt/input are ever persisted; only the validated structured result (`overallRisk`, `executiveSummary`, and the child `FindingAssessment`/`FindingCorrelation` rows) is stored.
+
+### No AI memory, no autonomous action
+
+No vector database, no embeddings, no long-term AI memory — every analysis reasons over exactly one scan's current findings, nothing more. No cross-scan intelligence exists yet; that is explicitly left to a future, separately-designed stage. The AI never executes commands, makes arbitrary network requests, launches scans, calls ZAP directly, generates or executes exploits, or modifies a target application, infrastructure, or credentials — it is an analyst, never an autonomous agent.
 
 ---
 

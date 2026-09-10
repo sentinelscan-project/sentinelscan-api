@@ -77,6 +77,29 @@ const baseEnvSchema = z.object({
   ZAP_OVERALL_SCAN_TIMEOUT_MS: z.coerce.number().int().positive().default(40 * 60_000),
   /** How often the executor polls ZAP for spider/active-scan progress. */
   ZAP_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(2_000),
+
+  // ---------------------------------------------------------------------
+  // Stage 6 & 7: AI Security Analyst (Google Gemini).
+  //
+  // Google Gemini is the AI provider (see
+  // `modules/analysis/providers/gemini-security-analysis-model.ts`) — the
+  // `SecurityAnalysisModel` interface exists so another provider could be
+  // added later without touching anything above it. `GEMINI_API_KEY` is
+  // deliberately optional so the API still boots and every other feature
+  // keeps working without it — a `POST /scans/:scanId/analyze` request made
+  // without one is accepted (the `SecurityAnalysis` row is created) but the
+  // analysis itself finishes `failed` with a safe error message, exactly
+  // like any other AI-provider failure. It is never sent to the browser and
+  // never logged.
+  // ---------------------------------------------------------------------
+  AI_PROVIDER: z.enum(["gemini"]).default("gemini"),
+  /** Which Gemini model performs security analysis. */
+  AI_MODEL: z.string().min(1).default("gemini-2.5-flash"),
+  GEMINI_API_KEY: optionalNonEmptyString,
+  /** Per-analysis timeout for the AI provider call itself. */
+  ANALYSIS_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+  /** Ceiling on the model's own output size for one analysis. */
+  ANALYSIS_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(8_000),
 });
 
 const envSchema = baseEnvSchema.and(googleOAuthSchema);

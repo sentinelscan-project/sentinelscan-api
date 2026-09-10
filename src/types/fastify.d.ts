@@ -32,6 +32,10 @@ declare module "fastify" {
     zapClient: import("../lib/zap-client.js").ZapClient;
     /** Runs queued scans against ZAP. Defaults to `ZapScanExecutor`. */
     scanExecutor: import("../modules/scans/scan-executor.js").ScanExecutor;
+    /** The AI security analysis persistence boundary the app was built with. */
+    analysisRepository: import("../repositories/analysis.repository.js").AnalysisRepository;
+    /** Runs queued AI analyses. Defaults to `SecurityAnalysisExecutor`. */
+    analysisExecutor: import("../modules/analysis/analysis-executor.js").AnalysisExecutor;
   }
 
   interface FastifyRequest {
