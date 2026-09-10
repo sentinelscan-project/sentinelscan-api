@@ -7,8 +7,11 @@ import { assertTargetIsSafeToScan, TargetSafetyViolation } from "../src/lib/targ
 import { buildApp } from "../src/app.js";
 import { getPrismaClient } from "../src/db/prisma.js";
 
+const AUTH_COOKIE = "sentinelscan_token";
+
 describe("Stage 8: Live Integration & System Verification", () => {
   const zapUrl = process.env.ZAP_BASE_URL || "http://localhost:8090";
+  const zapApiKey = process.env.ZAP_API_KEY?.trim();
   const geminiApiKey = process.env.GEMINI_API_KEY?.trim();
   const liveTargetUrl = process.env.LIVE_TARGET_URL?.trim();
 
@@ -33,7 +36,11 @@ describe("Stage 8: Live Integration & System Verification", () => {
 
   describe("2. OWASP ZAP Live Daemon Reachability", () => {
     it("evaluates live ZAP daemon reachability over configured ZAP_BASE_URL", async () => {
-      const client = new HttpZapClient({ baseUrl: zapUrl, timeoutMs: 3000 });
+      const client = new HttpZapClient({
+        baseUrl: zapUrl,
+        apiKey: zapApiKey,
+        requestTimeoutMs: 3000,
+      });
       const health = await client.health();
 
       if (health.reachable) {
@@ -123,67 +130,180 @@ describe("Stage 8: Live Integration & System Verification", () => {
   });
 
   describe("4. End-to-End Pipeline Execution (Real Application Stack)", () => {
-    it("validates prerequisites or executes full live scan -> findings -> Gemini flow", async () => {
-      const zapClient = new HttpZapClient({ baseUrl: zapUrl, timeoutMs: 3000 });
-      const zapHealth = await zapClient.health();
-
+    it("reports the explicit configuration required before the full live test can run", () => {
       if (!liveTargetUrl) {
         console.warn(
-          "[Stage 8 Pipeline] BLOCKED: No LIVE_TARGET_URL configured. Scanning arbitrary third-party targets or inventing synthetic targets is prohibited by safety policy.",
+          "[Stage 8 Pipeline] BLOCKED: LIVE_TARGET_URL is not configured. The full test is skipped; it will not invent or scan a third-party target.",
         );
-        return;
       }
-
-      if (!zapHealth.reachable) {
+      if (!geminiApiKey) {
         console.warn(
-          `[Stage 8 Pipeline] BLOCKED: Cannot run full live pipeline because ZAP is unreachable at ${zapUrl}.`,
+          "[Stage 8 Pipeline] BLOCKED: GEMINI_API_KEY is not configured. The full test is skipped because Gemini persistence is part of the Stage 8 acceptance path.",
         );
-        return;
       }
+    });
 
-      // If all prerequisites exist, execute via real Fastify application
+    // This is intentionally skipped, rather than reported as passed, until the
+    // operator supplies both secrets/configuration inputs.  In particular, a
+    // scan-only run is not allowed to masquerade as the full Stage 8 path.
+    it.skipIf(!liveTargetUrl || !geminiApiKey)("executes the real scan -> findings -> Gemini persistence flow", async () => {
+      const zapClient = new HttpZapClient({
+        baseUrl: zapUrl,
+        apiKey: zapApiKey,
+        requestTimeoutMs: 3000,
+      });
+      const zapHealth = await zapClient.health();
+
+      expect(zapHealth.reachable, `ZAP must be reachable at ${zapUrl} for the live Stage 8 test`).toBe(true);
+
+      // If all prerequisites exist, execute via real Fastify application with real database and real ZAP
       const app = buildApp();
       await app.ready();
+
+      const prisma = getPrismaClient();
+      let testUserId: string | undefined;
+      let targetId: string | undefined;
+      let scanId: string | undefined;
+      let analysisId: string | undefined;
 
       try {
         // Step A: Target safety assertion
         await assertTargetIsSafeToScan(liveTargetUrl);
 
-        // Step B: Target creation & scan creation via real Prisma repositories
-        const prisma = getPrismaClient();
-        const testUser = await prisma.user.create({
-          data: {
-            email: `pipeline-test-${Date.now()}@sentinelscan.local`,
-            passwordHash: "hash-not-used-in-direct-test",
-            name: "Pipeline Test User",
-            emailVerified: true,
-          },
+        // Step B: Authenticated user registration & session via real API
+        const email = `live-e2e-${Date.now()}@sentinelscan.local`;
+        const regRes = await app.inject({
+          method: "POST",
+          url: "/auth/register",
+          payload: { email, password: "ValidPassword123!", name: "Live Tester" },
+        });
+        expect(regRes.statusCode).toBe(201);
+
+        // Fetch user from DB to verify directly
+        const dbUser = await prisma.user.findUnique({ where: { email } });
+        expect(dbUser).not.toBeNull();
+        testUserId = dbUser!.id;
+
+        await prisma.user.update({
+          where: { id: testUserId },
+          data: { emailVerified: true },
         });
 
-        const target = await prisma.target.create({
-          data: {
-            name: "Authorized Live Target",
-            url: liveTargetUrl,
-            status: "active",
-            userId: testUser.id,
-          },
+        const loginRes = await app.inject({
+          method: "POST",
+          url: "/auth/login",
+          payload: { email, password: "ValidPassword123!" },
         });
+        expect(loginRes.statusCode).toBe(200);
+        const cookie = loginRes.cookies.find((c) => c.name === AUTH_COOKIE)?.value;
+        expect(cookie).toBeTruthy();
 
-        const scan = await prisma.scan.create({
-          data: {
-            targetId: target.id,
-            requestedById: testUser.id,
-            status: "queued",
-          },
+        // Step C: Create target
+        const targetRes = await app.inject({
+          method: "POST",
+          url: "/targets",
+          cookies: { [AUTH_COOKIE]: cookie! },
+          payload: { name: "Authorized Live Target", url: liveTargetUrl },
         });
+        expect(targetRes.statusCode).toBe(201);
+        targetId = targetRes.json().target.id;
 
-        console.info(`[Stage 8 Pipeline] Executing live scan for target=${liveTargetUrl}, scanId=${scan.id}`);
+        // Step D: Create scan (triggers real ZapScanExecutor asynchronously)
+        const scanRes = await app.inject({
+          method: "POST",
+          url: `/targets/${targetId}/scans`,
+          cookies: { [AUTH_COOKIE]: cookie! },
+        });
+        expect(scanRes.statusCode).toBe(201);
+        scanId = scanRes.json().scan.id;
 
-        // Note: Clean up test data afterwards
-        await prisma.scan.delete({ where: { id: scan.id } });
-        await prisma.target.delete({ where: { id: target.id } });
-        await prisma.user.delete({ where: { id: testUser.id } });
+        console.info(`[Stage 8 Pipeline] Scan queued scanId=${scanId}; awaiting completion...`);
+
+        // Step E: Poll until completed or timeout
+        let status = "queued";
+        const start = Date.now();
+        const maxWaitMs = 180_000; // 3 minutes maximum for live assessment
+        while (Date.now() - start < maxWaitMs) {
+          await new Promise((r) => setTimeout(r, 2000));
+          const checkRes = await app.inject({
+            method: "GET",
+            url: `/scans/${scanId}`,
+            cookies: { [AUTH_COOKIE]: cookie! },
+          });
+          status = checkRes.json().scan.status;
+          if (status === "completed" || status === "failed") break;
+        }
+
+        expect(status).toBe("completed");
+
+        // Step F: Retrieve normalized findings
+        const findingsRes = await app.inject({
+          method: "GET",
+          url: `/scans/${scanId}/findings`,
+          cookies: { [AUTH_COOKIE]: cookie! },
+        });
+        expect(findingsRes.statusCode).toBe(200);
+        const findings = findingsRes.json().findings;
+        const persistedFindings = await prisma.finding.findMany({
+          where: { scanId },
+          include: { instances: true },
+        });
+        expect(persistedFindings).toHaveLength(findings.length);
+        expect(findingsRes.json().counts.total).toBe(persistedFindings.length);
+        console.info(`[Stage 8 Pipeline] Scan completed with ${findings.length} findings.`);
+
+        // Step G: Trigger and verify real Gemini analysis plus persisted result.
+        const analyzeRes = await app.inject({
+          method: "POST",
+          url: `/scans/${scanId}/analyze`,
+          cookies: { [AUTH_COOKIE]: cookie! },
+        });
+        expect(analyzeRes.statusCode).toBe(202);
+        analysisId = analyzeRes.json().analysis.id;
+
+        let analysisStatus = "queued";
+        let analysisPayload: { analysis?: { id?: string; status?: string } } | undefined;
+        const aiStart = Date.now();
+        while (Date.now() - aiStart < 60_000) {
+          await new Promise((r) => setTimeout(r, 2000));
+          const analysisCheck = await app.inject({
+            method: "GET",
+            url: `/scans/${scanId}/analysis`,
+            cookies: { [AUTH_COOKIE]: cookie! },
+          });
+          expect(analysisCheck.statusCode).toBe(200);
+          analysisPayload = analysisCheck.json();
+          analysisStatus = analysisPayload.analysis?.status ?? "unknown";
+          if (analysisStatus === "completed" || analysisStatus === "failed") break;
+        }
+
+        expect(analysisStatus).toBe("completed");
+        expect(analysisPayload?.analysis?.id).toBe(analysisId);
+        const persistedAnalysis = await prisma.securityAnalysis.findUnique({
+          where: { id: analysisId },
+          include: { assessments: true, correlations: true },
+        });
+        expect(persistedAnalysis?.status).toBe("completed");
+        expect(persistedAnalysis?.executiveSummary).toBeTruthy();
+        expect(persistedAnalysis?.model).toBeTruthy();
+        console.info("[Stage 8 Pipeline] Gemini AI Security Analysis completed and persisted successfully.");
       } finally {
+        // Step H: Clean up test records in reverse order
+        if (analysisId) {
+          await prisma.securityAnalysis.delete({ where: { id: analysisId } }).catch(() => undefined);
+        }
+        if (scanId) {
+          await prisma.findingInstance.deleteMany({ where: { finding: { scanId } } }).catch(() => undefined);
+          await prisma.finding.deleteMany({ where: { scanId } }).catch(() => undefined);
+          await prisma.scan.delete({ where: { id: scanId } }).catch(() => undefined);
+        }
+        if (targetId) {
+          await prisma.target.delete({ where: { id: targetId } }).catch(() => undefined);
+        }
+        if (testUserId) {
+          await prisma.emailVerificationToken.deleteMany({ where: { userId: testUserId } }).catch(() => undefined);
+          await prisma.user.delete({ where: { id: testUserId } }).catch(() => undefined);
+        }
         await app.close();
       }
     });

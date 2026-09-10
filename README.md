@@ -1204,6 +1204,29 @@ docker run -p 4000:4000 \
 ```
 This assumes `sentinelscan-api` and an `owasp-zap` container share a Docker network (see `docker-compose.yml` at the workspace root, which wires this up directly rather than needing manual flags).
 
+### Opt-in local live-test access
+
+The normal Compose topology deliberately keeps ZAP port `8090` off the host.
+For the Stage 8 live test only, a developer may start Compose with the
+untracked-secret-safe override at the workspace root:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.live-test.yml up -d --build
+```
+
+That override binds ZAP to `127.0.0.1:8090` only; it does not publish the
+daemon to a LAN interface or the public internet. Put `GEMINI_API_KEY`, the
+real/disposable `DATABASE_URL`, and an explicitly authorized public
+`LIVE_TARGET_URL` in the ignored local `.env`, then run:
+
+```bash
+ZAP_BASE_URL=http://127.0.0.1:8090 npm test -- --run tests/live-integration.test.ts
+```
+
+The full pipeline test remains skipped unless both `GEMINI_API_KEY` and
+`LIVE_TARGET_URL` are present. It does not invent a target, bypass target
+safety, or treat a scan-only run as a full validation.
+
 ---
 
 ## CI/CD Pipeline
