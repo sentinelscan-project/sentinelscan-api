@@ -140,8 +140,9 @@ model Scan {
   createdAt     DateTime   @default(now())
   updatedAt     DateTime   @updatedAt
 
-  target      Target @relation(fields: [targetId], references: [id], onDelete: Restrict)
-  requestedBy User   @relation(fields: [requestedById], references: [id], onDelete: Restrict)
+  target      Target    @relation(fields: [targetId], references: [id], onDelete: Restrict)
+  requestedBy User      @relation(fields: [requestedById], references: [id], onDelete: Restrict)
+  findings    Finding[]
 
   @@index([targetId])
   @@index([requestedById])
@@ -150,5 +151,140 @@ model Scan {
   // /scans runs — better than a bare index on `createdAt` alone would.
   @@index([requestedById, createdAt])
   @@map("scans")
+}
+
+/// SentinelScan's own severity scale. Deliberately not ZAP's "risk" strings
+/// (High/Medium/Low/Informational) — this is the vendor-neutral scale every
+/// scanner source normalizes into. `critical` exists even though nothing in
+/// this codebase currently produces it (ZAP's risk levels top out at High);
+/// it is here so a future scanner (or a future ZAP alert tag/rule) that does
+/// distinguish a critical tier has somewhere to map to without a schema
+/// change.
+enum FindingSeverity {
+  critical
+  high
+  medium
+  low
+  informational
+}
+
+/// How confident the scanner is that a finding is a true positive.
+/// `unknown` is the documented fallback for a source that doesn't report
+/// confidence, or reports something this codebase doesn't recognize — never
+/// silently invented as `low` or `medium`, which would misrepresent it.
+enum FindingConfidence {
+  high
+  medium
+  low
+  unknown
+}
+
+// `category` (below, on `Finding`) is deliberately a plain `String`, not a
+// Prisma `enum`, even though it is a closed, validated set of values — see
+// `FINDING_CATEGORIES` in `modules/findings/finding-category.ts` for that
+// set and its wire-format documentation. Prisma enum *values* must be valid
+// identifiers (no hyphens), and a value's `@map` only renames its Postgres
+// storage label — the JS-facing string Prisma Client actually returns is
+// always the identifier itself. There is no way to make a Prisma enum whose
+// JS value is a hyphenated slug like `"security-misconfiguration"`, which is
+// the wire format this category set intentionally uses (matching typical
+// kebab-case REST conventions, and the exact spelling used throughout this
+// project's Stage 5 API surface and documentation). Rather than force an
+// awkward camelCase-in-JS/hyphenated-at-the-boundary translation layer, or
+// silently ship a different wire format than intended, category validation
+// lives at the application boundary (Zod, matching the closed set) instead
+// of the database layer. `severity` and `confidence` below stay real Prisma
+// enums: their value sets need no hyphens, so they get the database-level
+// guarantee with no such tradeoff.
+
+/// One normalized vulnerability/security issue identified during a `Scan`.
+///
+/// A `Finding` represents *one logical vulnerability/rule for one scan* — not
+/// a specific occurrence. Where it was found (potentially several places) is
+/// `FindingInstance`. This model deliberately does not mirror any scanner's
+/// raw schema: `source`/`sourceRuleId` are the only scanner-specific fields,
+/// kept purely for traceability back to where a finding came from. See
+/// `modules/findings/normalized-finding.ts` for the scanner-neutral shape
+/// every adapter (ZAP today, anything else later) must produce, and
+/// `modules/findings/zap/` for the ZAP-specific adapter and its severity/
+/// confidence/category mapping tables.
+///
+/// Deduplication: at most one `Finding` per `(scanId, source, sourceRuleId)`
+/// — the same rule firing at multiple URLs in one scan is one `Finding` with
+/// multiple `FindingInstance` rows, not multiple `Finding` rows. The same
+/// rule firing again in a *different* scan (even against the same target) is
+/// a separate `Finding`: findings are scoped to the scan that produced them,
+/// never deduplicated globally across scans, because each scan is its own
+/// historical record of what was true at that point in time. See the
+/// README's "Deduplication Strategy" section for the full reasoning,
+/// including the fallback used when a source has no stable rule identifier.
+///
+/// Delete behavior: `scan` is `Restrict`, matching `Scan`'s own relations —
+/// findings are historical scan results, and a `Scan` cannot currently be
+/// deleted through any endpoint in this codebase at all, so this is a
+/// consistent, defensive schema-level choice rather than something
+/// exercised today. `instances` cascades: a `FindingInstance` has no
+/// independent identity or historical significance apart from the `Finding`
+/// it belongs to, unlike `Finding` itself relative to `Scan`.
+model Finding {
+  id           String            @id @default(uuid())
+  scanId       String
+  title        String
+  description  String
+  severity     FindingSeverity
+  confidence   FindingConfidence
+  /// A closed set of values, validated at the application layer — see the
+  /// comment above `FindingSeverity` for why this is a `String`, not an `enum`.
+  category     String
+  /// Common Weakness Enumeration id (e.g. 79 for CWE-79), when the source provides one.
+  cweId        Int?
+  /// Web Application Security Consortium id, when the source provides one.
+  wascId       Int?
+  remediation  String?
+  /// A JSON array of reference URLs (strings). Structured just enough for a
+  /// future frontend/AI layer to iterate over cleanly, without inventing a
+  /// separate table for what is, in practice, always a short flat list.
+  references   Json?
+  /// Which scanner produced this finding, e.g. `"zap"`. A plain string, not
+  /// an enum: a new scanner source must not require a migration to exist —
+  /// see this file's "vendor-neutral" principle at the top.
+  source       String
+  /// The source scanner's own stable rule/plugin identifier (ZAP's
+  /// `pluginId`, e.g. `"10020"`), when available. Never just the
+  /// human-readable alert name — see the dedup comment above.
+  sourceRuleId String?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  scan      Scan              @relation(fields: [scanId], references: [id], onDelete: Restrict)
+  instances FindingInstance[]
+
+  @@unique([scanId, source, sourceRuleId])
+  @@index([scanId])
+  @@index([scanId, severity])
+  @@map("findings")
+}
+
+/// One location where a `Finding`'s vulnerability/rule was actually observed
+/// — a specific URL, and where applicable the HTTP method, parameter, attack
+/// payload, and a short evidence snippet. Deliberately not a full HTTP
+/// request/response capture: `attack`/`evidence`/`parameter` are sanitized
+/// (secrets redacted, length capped — see `lib/sanitize-text.ts`) and bounded
+/// scanner-output snippets, never raw request/response bodies, cookies,
+/// Authorization headers, or other credential material.
+model FindingInstance {
+  id        String   @id @default(uuid())
+  findingId String
+  url       String
+  method    String?
+  parameter String?
+  attack    String?
+  evidence  String?
+  createdAt DateTime @default(now())
+
+  finding Finding @relation(fields: [findingId], references: [id], onDelete: Cascade)
+
+  @@index([findingId])
+  @@map("finding_instances")
 }
 

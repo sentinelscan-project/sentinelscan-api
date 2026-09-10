@@ -1,8 +1,11 @@
 import type { ScanExecutionContext, ScanExecutor } from "./scan-executor.js";
 import type { ScanRepository } from "../../repositories/scan.repository.js";
+import type { FindingRepository } from "../../repositories/finding.repository.js";
 import { ZapRequestError, type ZapClient } from "../../lib/zap-client.js";
 import { assertTargetIsSafeToScan, TargetSafetyViolation } from "../../lib/target-safety.js";
 import { buildOriginScopeRegex } from "../../lib/url.js";
+import { normalizeZapAlerts } from "../findings/zap/zap-alert-normalizer.js";
+import type { ZapRawAlert } from "../findings/zap/zap-alert.js";
 import { completeScan, failScan, startScan } from "./scan.service.js";
 
 export interface ZapScanExecutorConfig {
@@ -75,6 +78,7 @@ export class ZapScanExecutor implements ScanExecutor {
   constructor(
     private readonly zapClient: ZapClient,
     private readonly scanRepository: ScanRepository,
+    private readonly findingRepository: FindingRepository,
     private readonly config: ZapScanExecutorConfig,
   ) {}
 
@@ -132,12 +136,20 @@ export class ZapScanExecutor implements ScanExecutor {
       });
       console.info(`[ScanExecutor] scanId=${scanId} active scan completed`);
 
-      // Stage 4 proves the pipeline end to end; it does not persist findings.
-      // A per-risk-level count is a safe, useful thing to log — never the
-      // full alert bodies (which can contain response snippets/evidence).
-      const summary = await this.zapClient.alertSummary(targetUrl);
-      const summaryText = summary.length > 0 ? summary.map((s) => `${s.risk}=${s.count}`).join(", ") : "none";
-      console.info(`[ScanExecutor] scanId=${scanId} raw results collected (${summaryText})`);
+      const rawAlerts = await this.zapClient.alerts(targetUrl);
+      console.info(`[ScanExecutor] scanId=${scanId} raw alerts collected (${rawAlerts.length})`);
+
+      // Normalization is pure/in-process (no I/O), so it happens outside any
+      // transaction. Persistence below is the only DB write here, and it
+      // runs strictly before `completeScan` — ZAP having finished
+      // successfully is not, by itself, enough to mark the scan `completed`;
+      // see the README's "Persistence Lifecycle" section. A failure at
+      // either step falls through to `handleFailure` below, which marks the
+      // scan `failed` rather than ever reporting success with findings
+      // silently missing.
+      const normalizedFindings = normalizeZapAlerts(rawAlerts as ZapRawAlert[]);
+      await this.findingRepository.createMany(scanId, normalizedFindings);
+      console.info(`[ScanExecutor] scanId=${scanId} persisted ${normalizedFindings.length} finding(s)`);
 
       await completeScan(this.scanRepository, scanId);
       console.info(`[ScanExecutor] scanId=${scanId} completed`);

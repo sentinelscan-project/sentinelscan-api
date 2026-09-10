@@ -23,6 +23,17 @@ export interface ZapAlertSummary {
   count: number;
 }
 
+/**
+ * One raw alert object exactly as ZAP's `/JSON/core/view/alerts/` returns it
+ * — untyped here deliberately. `ZapClient` only knows how to call ZAP and
+ * unwrap the response envelope; it does not know (and should not need to
+ * know) which fields a given alert carries or what they mean. Interpreting
+ * this shape is `modules/findings/zap/zap-alert-normalizer.ts`'s job — see
+ * its `ZapRawAlert` type for the documented, field-level shape confirmed
+ * against a live ZAP daemon.
+ */
+export type ZapAlertRecord = Record<string, unknown>;
+
 export interface ZapClient {
   /** Verifies connectivity without side effects — used for `GET /health/zap`. */
   health(): Promise<ZapHealth>;
@@ -44,6 +55,8 @@ export interface ZapClient {
   stopActiveScan(scanId: string): Promise<void>;
   /** Per-risk-level alert counts for everything found under `baseUrl` — a summary, not raw alert bodies. */
   alertSummary(baseUrl: string): Promise<ZapAlertSummary[]>;
+  /** Every individual raw alert found under `baseUrl` — one element per occurrence, not deduplicated by rule. */
+  alerts(baseUrl: string): Promise<ZapAlertRecord[]>;
 }
 
 /**
@@ -214,6 +227,15 @@ export class HttpZapClient implements ZapClient {
       risk,
       count: typeof count === "number" ? count : Number(count) || 0,
     }));
+  }
+
+  async alerts(baseUrl: string): Promise<ZapAlertRecord[]> {
+    const body = await this.call("/JSON/core/view/alerts/", { baseurl: baseUrl });
+    const alerts = asRecord(body)?.alerts;
+    if (!Array.isArray(alerts)) {
+      return [];
+    }
+    return alerts.filter((entry): entry is ZapAlertRecord => asRecord(entry) !== null);
   }
 }
 

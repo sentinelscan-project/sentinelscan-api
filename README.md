@@ -1,9 +1,9 @@
 # SentinelScan API (`sentinelscan-api`)
 
 ## Overview
-`sentinelscan-api` is the backend API service for **SentinelScan**. Built with Fastify and TypeScript, it provides the core API foundation, environment configuration validation with Zod, PostgreSQL persistence using Prisma, identity and authentication, authorized target management, scan orchestration backed by a real OWASP ZAP integration, centralized logging and error handling, and container packaging.
+`sentinelscan-api` is the backend API service for **SentinelScan**. Built with Fastify and TypeScript, it provides the core API foundation, environment configuration validation with Zod, PostgreSQL persistence using Prisma, identity and authentication, authorized target management, scan orchestration backed by a real OWASP ZAP integration, vendor-neutral finding normalization and persistence, centralized logging and error handling, and container packaging.
 
-> **Stage 4 Notice**: This repository currently implements the backend foundation (Stage 0), identity and authentication (Stage 1), target registration/management (Stage 2), scan orchestration (Stage 3), and **real OWASP ZAP execution (Stage 4)**. Creating a scan now actually crawls and active-scans the target through a ZAP daemon reachable over the internal Docker network — see [OWASP ZAP Integration](#owasp-zap-integration) below for the target-safety policy, scope enforcement, timeouts, cancellation, and concurrency model this relies on. What Stage 4 deliberately does **not** do: it does not persist findings (raw ZAP results are logged as a summary and discarded, not stored), does not normalize or correlate anything, and does not run any AI analysis. There is also no SentinelScan-native discovery engine or scanner yet — ZAP is the only scan engine. `User`, `Target` and `Scan` are still the only domain models; later stages will attach findings, AI analyses and reports to `Scan`.
+> **Stage 5 Notice**: This repository currently implements the backend foundation (Stage 0), identity and authentication (Stage 1), target registration/management (Stage 2), scan orchestration (Stage 3), real OWASP ZAP execution (Stage 4), and **findings & vulnerability normalization (Stage 5)**. A completed scan now normalizes ZAP's raw alerts into SentinelScan's own vendor-neutral `Finding`/`FindingInstance` model and persists them to PostgreSQL before the scan is reported `completed` — see [Findings & Vulnerability Normalization](#findings--vulnerability-normalization) below for the normalization architecture, severity/confidence/category mapping, deduplication strategy, sanitization rules, persistence lifecycle, and the new `GET /scans/:scanId/findings` / `GET /findings/:id` endpoints. What Stage 5 deliberately does **not** do: no AI/LLM analysis of findings, no SentinelScan-native discovery engine or scanner (ZAP remains the only scan engine), no automated remediation. `User`, `Target`, `Scan`, `Finding` and `FindingInstance` are the only domain models; a later stage will attach AI analyses and reports.
 
 ---
 
@@ -30,7 +30,7 @@
 sentinelscan-api/
 ├── prisma/
 │   ├── migrations/           # Versioned SQL migrations
-│   └── schema.prisma         # Datasource, generator, User, Target and Scan models
+│   └── schema.prisma         # Datasource, generator, User, Target, Scan, Finding and FindingInstance models
 ├── src/
 │   ├── app.ts                # Fastify app factory with middleware & error handling
 │   ├── config.ts             # Zod environment validation & startup check
@@ -57,12 +57,24 @@ sentinelscan-api/
 │   │   │   ├── target.routes.ts  # /targets CRUD + nested POST /:targetId/scans
 │   │   │   ├── target.schemas.ts # Zod request schemas & URL normalization wiring
 │   │   │   └── target.service.ts # Ownership-enforced create/list/get/update/delete
-│   │   └── scans/
-│   │       ├── scan.routes.ts        # GET /scans, GET /scans/:id, POST /scans/:id/cancel
-│   │       ├── scan.schemas.ts       # Zod request schemas, list-query pagination
-│   │       ├── scan.service.ts       # Lifecycle state machine, ownership-enforced operations
-│   │       ├── scan-executor.ts      # ScanExecutor interface + inert NotImplementedScanExecutor
-│   │       └── zap-scan-executor.ts  # The real Stage 4 executor: ZapClient-driven, mutex-serialized
+│   │   ├── scans/
+│   │   │   ├── scan.routes.ts        # GET /scans, GET /scans/:id, POST /scans/:id/cancel, GET /scans/:id/findings
+│   │   │   ├── scan.schemas.ts       # Zod request schemas, list-query pagination
+│   │   │   ├── scan.service.ts       # Lifecycle state machine, ownership-enforced operations
+│   │   │   ├── scan-executor.ts      # ScanExecutor interface + inert NotImplementedScanExecutor
+│   │   │   └── zap-scan-executor.ts  # ZapClient-driven executor; now also normalizes + persists findings (Stage 5)
+│   │   └── findings/
+│   │       ├── finding-category.ts       # FINDING_CATEGORIES closed list & FindingCategory type
+│   │       ├── normalized-finding.ts     # Vendor-neutral NormalizedFinding/NormalizedFindingInstance contract
+│   │       ├── finding.schemas.ts        # Zod request schemas (filters, pagination)
+│   │       ├── finding.service.ts        # Ownership-enforced finding read operations
+│   │       ├── finding.routes.ts         # GET /findings/:id
+│   │       └── zap/
+│   │           ├── zap-alert.ts               # Raw ZAP alert shape + defensive parsing helpers
+│   │           ├── zap-severity-mapping.ts     # ZAP risk → FindingSeverity (centralized, documented fallback)
+│   │           ├── zap-confidence-mapping.ts   # ZAP confidence → FindingConfidence (centralized, documented fallback)
+│   │           ├── zap-category-mapping.ts     # ZAP pluginId → FindingCategory (centralized, documented fallback)
+│   │           └── zap-alert-normalizer.ts     # ZapRawAlert[] → NormalizedFinding[] (grouping, dedup, sanitization)
 │   ├── plugins/
 │   │   └── authentication.ts # JWT + cookie session, `authenticate` preHandler
 │   ├── repositories/
@@ -72,7 +84,9 @@ sentinelscan-api/
 │   │   ├── target.repository.ts        # TargetRepository interface & PublicTarget
 │   │   ├── prisma-target.repository.ts # Prisma implementation (ownership-scoped queries)
 │   │   ├── scan.repository.ts          # ScanRepository interface & PublicScan
-│   │   └── prisma-scan.repository.ts   # Prisma implementation (atomic CAS transitions)
+│   │   ├── prisma-scan.repository.ts   # Prisma implementation (atomic CAS transitions)
+│   │   ├── finding.repository.ts       # FindingRepository interface & PublicFinding
+│   │   └── prisma-finding.repository.ts # Prisma implementation (transaction-wrapped createMany)
 │   ├── routes/
 │   │   └── health.ts         # GET /health, GET /health/zap
 │   └── types/
@@ -82,15 +96,19 @@ sentinelscan-api/
 │   │   ├── in-memory-user.repository.ts   # Database-free User/token/email test doubles
 │   │   ├── in-memory-target.repository.ts # Database-free TargetRepository for tests
 │   │   ├── in-memory-scan.repository.ts   # Database-free ScanRepository (reproduces CAS semantics)
+│   │   ├── in-memory-finding.repository.ts # Database-free FindingRepository (reproduces transaction/failure semantics)
 │   │   ├── fake-zap-client.ts             # Scriptable ZapClient test double (no real HTTP)
 │   │   └── fake-scan-executor.ts          # No-op ScanExecutor so orchestration tests don't touch ZAP
 │   ├── auth.test.ts              # Registration, verification, login, session, logout tests
 │   ├── google-auth.test.ts       # Google identity & unconfigured-provider tests
 │   ├── targets.test.ts           # Target CRUD, ownership isolation, validation tests
 │   ├── scans.test.ts             # Scan orchestration, lifecycle, ownership isolation tests
+│   ├── findings.test.ts          # Findings API: filtering, counts, pagination, ownership isolation
 │   ├── target-safety.test.ts     # SSRF policy: IP ranges, DNS resolution, DNS-rebinding awareness
 │   ├── zap-client.test.ts        # HttpZapClient against a mocked fetch
-│   ├── zap-scan-executor.test.ts # Full execution lifecycle against a fake ZapClient
+│   ├── zap-scan-executor.test.ts # Full execution lifecycle incl. finding persistence, against a fake ZapClient
+│   ├── zap-alert-normalizer.test.ts # Severity/confidence/category mapping, grouping, dedup, sanitization
+│   ├── sanitize-text.test.ts     # Credential redaction & length-capping rules
 │   └── health.test.ts            # /health and /health/zap tests
 ├── .dockerignore
 ├── .env.example
@@ -266,9 +284,49 @@ Indexed on `targetId`, `requestedById`, and `status` individually, plus a compos
 
 **Delete behavior — deliberately `Restrict` on both foreign keys, not `Cascade`:** a `Scan` is the historical record of an assessment that was requested (and possibly ran), so cascading it away whenever its `Target` or requesting `User` is deleted would silently destroy that audit trail. A target with any scan history cannot be deleted (`409 TARGET_HAS_SCANS`) until an explicit archival/retention story exists in a later stage. There is no account-deletion endpoint anywhere in this codebase yet, so the `requestedById` side of this cannot currently be exercised through the API — it is set deliberately rather than left to a default, so that whenever account deletion is built, deleting a user with scan history fails loudly instead of silently erasing who requested what.
 
-Later stages will hang `Finding → AiAnalysis → Report` off `Scan`; none of those models exist yet.
+### `Finding` (table `findings`)
 
-Persistence for all three models is reached through a repository interface (`UserRepository`, `TargetRepository`, `ScanRepository`) rather than Prisma directly, so route handlers stay database-agnostic and the test suite can run against an in-memory implementation with no PostgreSQL instance. `ScanRepository`'s status-transition method is a compare-and-swap (`UPDATE ... WHERE status = $expected`, via Prisma's `updateMany`), which is what makes two simultaneous requests to cancel (or otherwise transition) the same scan resolve safely — see [Scan lifecycle](#scan-lifecycle).
+One normalized vulnerability/security issue identified during a `Scan` — *one logical vulnerability/rule for that scan*, not a specific occurrence (that's `FindingInstance`, below). This model deliberately does **not** mirror any scanner's raw schema; `source`/`sourceRuleId` are the only scanner-specific fields, kept purely for traceability. See [Findings & Vulnerability Normalization](#findings--vulnerability-normalization) for the full normalization architecture.
+
+| Column | Type | Notes |
+| :--- | :--- | :--- |
+| `id` | `String` (uuid) | Primary key |
+| `scanId` | `String` | Foreign key to `Scan.id`, `onDelete: Restrict` |
+| `title` | `String` | Sanitized, length-capped |
+| `description` | `String` | Sanitized, length-capped |
+| `severity` | `FindingSeverity` | `critical` \| `high` \| `medium` \| `low` \| `informational` |
+| `confidence` | `FindingConfidence` | `high` \| `medium` \| `low` \| `unknown` |
+| `category` | `String` | One of `FINDING_CATEGORIES` (`modules/findings/finding-category.ts`) — a plain `String` column, not a Prisma `enum`; see the comment above `FindingSeverity` in `schema.prisma` for why (Prisma enum *values* can't be hyphenated, and this category set's wire format intentionally is) |
+| `cweId` | `Int?` | Common Weakness Enumeration id, when the source provides one |
+| `wascId` | `Int?` | Web Application Security Consortium id, when the source provides one |
+| `remediation` | `String?` | Sanitized, length-capped |
+| `references` | `Json?` | An array of sanitized, length-capped reference URL strings |
+| `source` | `String` | Which scanner produced this finding, e.g. `"zap"` — a plain string, not an enum, so a new scanner source never requires a migration |
+| `sourceRuleId` | `String?` | The source's own stable rule identifier (ZAP's `pluginId`, e.g. `"40018"`); never just the human-readable name |
+| `createdAt` / `updatedAt` | `DateTime` | Standard timestamps |
+
+Unique on `(scanId, source, sourceRuleId)` — see [Deduplication Strategy](#deduplication-strategy). Indexed on `scanId` and `(scanId, severity)`. **Delete behavior**: `Restrict`, matching `Scan`'s own relations — a `Scan` cannot currently be deleted through any endpoint at all, so this is a consistent, defensive choice.
+
+### `FindingInstance` (table `finding_instances`)
+
+One location where a `Finding`'s rule was actually observed — a specific URL, and where applicable the HTTP method, parameter, attack payload, and a short evidence snippet.
+
+| Column | Type | Notes |
+| :--- | :--- | :--- |
+| `id` | `String` (uuid) | Primary key |
+| `findingId` | `String` | Foreign key to `Finding.id`, `onDelete: Cascade` |
+| `url` | `String` | Sanitized, length-capped |
+| `method` | `String?` | e.g. `"GET"` |
+| `parameter` | `String?` | Sanitized, length-capped |
+| `attack` | `String?` | Sanitized, length-capped attack payload snippet |
+| `evidence` | `String?` | Sanitized, length-capped evidence snippet — **never** a raw HTTP request/response body |
+| `createdAt` | `DateTime` | Standard timestamp |
+
+Indexed on `findingId`. **Delete behavior**: `Cascade` — a `FindingInstance` has no independent identity or historical significance apart from the `Finding` it belongs to, unlike `Finding` itself relative to `Scan`.
+
+Later stages will hang `AiAnalysis → Report` off `Scan`/`Finding`; neither model exists yet.
+
+Persistence for all five models is reached through a repository interface (`UserRepository`, `TargetRepository`, `ScanRepository`, `FindingRepository`) rather than Prisma directly, so route handlers stay database-agnostic and the test suite can run against an in-memory implementation with no PostgreSQL instance. `ScanRepository`'s status-transition method is a compare-and-swap (`UPDATE ... WHERE status = $expected`, via Prisma's `updateMany`), which is what makes two simultaneous requests to cancel (or otherwise transition) the same scan resolve safely — see [Scan lifecycle](#scan-lifecycle). `FindingRepository.createMany` wraps every `Finding`/`FindingInstance` write for one scan in a single Prisma `$transaction` — see [Persistence Lifecycle](#persistence-lifecycle--transaction-behavior).
 
 ---
 
@@ -577,6 +635,73 @@ Valid only from `queued` or `running`. If the scan had already started, `started
 
 `requestedById` is never included — the caller already knows every scan returned here is theirs.
 
+### Findings
+
+Every route requires authentication. See [Findings & Vulnerability Normalization](#findings--vulnerability-normalization) for the normalization/persistence architecture behind these endpoints.
+
+#### `GET /scans/:scanId/findings`
+
+Findings for one scan — only when the caller owns it (same non-enumerable-404 rule as everywhere else: another user's scan and a nonexistent one are indistinguishable). Query parameters (all optional):
+
+| Parameter | Notes |
+| :--- | :--- |
+| `severity` | One of `critical`, `high`, `medium`, `low`, `informational` |
+| `confidence` | One of `high`, `medium`, `low`, `unknown` |
+| `category` | One of `FINDING_CATEGORIES` (see below) |
+| `source` | Free text, e.g. `zap` |
+| `limit` | 1–100, default 20 |
+| `offset` | ≥ 0, default 0 |
+
+- `200` — `{ "findings": [ { ... }, ... ], "counts": { "critical": 0, "high": 2, "medium": 1, "low": 0, "informational": 3, "total": 6 }, "limit": 20, "offset": 0, "hasMore": false }`
+  - `counts` is always the scan's **full, unfiltered** severity breakdown, derived live from the persisted `Finding` rows — never from ZAP's own alert-summary log, and never affected by `severity`/`confidence`/`category`/`source` filters applied to `findings` itself.
+- `400` `VALIDATION_ERROR` — an invalid filter value, or `limit`/`offset` out of range
+- `401` `UNAUTHORIZED` — no valid session
+- `404` `SCAN_NOT_FOUND` — no such scan, *or* it was requested by a different user
+
+#### `GET /findings/:id`
+
+A single finding with its instances — only when it belongs to a scan the caller owns (via a join through `Finding.scan.requestedById`, since there is no `scanId` in this URL to pre-validate ownership through).
+
+- `200` — `{ "finding": { ... } }`
+- `400` `VALIDATION_ERROR` — `:id` is not a well-formed UUID
+- `401` `UNAUTHORIZED` — no valid session
+- `404` `FINDING_NOT_FOUND` — no such finding, *or* its scan belongs to a different user
+
+#### Safe finding representation
+
+```json
+{
+  "id": "a1b2...",
+  "scanId": "9c2a...",
+  "title": "X-Frame-Options Header Not Set",
+  "description": "X-Frame-Options header is not included in the HTTP response...",
+  "severity": "medium",
+  "confidence": "medium",
+  "category": "security-header",
+  "cweId": 1021,
+  "wascId": 15,
+  "remediation": "Most modern Web browsers support the Content-Security-Policy...",
+  "references": ["https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Frame-Options"],
+  "source": "zap",
+  "sourceRuleId": "10020",
+  "createdAt": "2026-09-10T09:05:00.000Z",
+  "updatedAt": "2026-09-10T09:05:00.000Z",
+  "instances": [
+    {
+      "id": "c3d4...",
+      "url": "https://staging.acme.example.com/",
+      "method": "GET",
+      "parameter": null,
+      "attack": null,
+      "evidence": null,
+      "createdAt": "2026-09-10T09:05:00.000Z"
+    }
+  ]
+}
+```
+
+No raw ZAP response, no internal Prisma field, and no secret ever crosses this boundary — see [Sanitization](#sanitization).
+
 ### Error format
 
 ```json
@@ -612,7 +737,7 @@ Automated tests never contact Google: account resolution is exercised directly w
 
 ## OWASP ZAP Integration
 
-**Stage 4 wires a real ZAP daemon into scan execution.** This section covers the architecture, the SSRF/scope safety boundary, timeouts, cancellation, and concurrency model — and, just as importantly, what this stage deliberately does *not* do. There is no SentinelScan-native discovery engine or scanner (ZAP is the only scan engine so far), no finding normalization or correlation, and no AI analysis. Raw ZAP results are summarized (counts per risk level) for a log line and then discarded — nothing is persisted beyond the `Scan` row's own lifecycle fields.
+**Stage 4 wires a real ZAP daemon into scan execution.** This section covers the architecture, the SSRF/scope safety boundary, timeouts, cancellation, and concurrency model. As of Stage 5, a successful ZAP run's raw alerts are normalized and persisted as `Finding`/`FindingInstance` rows before the scan is reported `completed` — see [Findings & Vulnerability Normalization](#findings--vulnerability-normalization) for that part of the pipeline. There is still no SentinelScan-native discovery engine or scanner (ZAP is the only scan engine) and no AI analysis.
 
 ### Architecture
 
@@ -660,12 +785,14 @@ queued
   → create scan-scoped ZAP context, set origin scope
   → spider (crawl) the target, polling until 100% or timeout
   → active scan the target, polling until 100% or timeout
-  → collect a per-risk-level alert count (logged, not persisted)
+  → fetch raw ZAP alerts (ZapClient.alerts)
+  → normalize into NormalizedFinding[] (zap-alert-normalizer.ts)
+  → persist Finding + FindingInstance rows (FindingRepository.createMany, one transaction)
   → completed
   → (finally) remove the ZAP context
 ```
 
-A failure at any step — target-safety rejection, ZAP unreachable, a malformed ZAP response, a phase timeout — moves the scan to `failed` with a safe (never-raw) message in `Scan.errorMessage` via `failScan`, and still runs the context-removal cleanup. A scan is marked `completed` only when the active scan itself actually reached 100%, never earlier.
+A failure at any step — target-safety rejection, ZAP unreachable, a malformed ZAP response, a phase timeout, or a finding-persistence failure — moves the scan to `failed` with a safe (never-raw) message in `Scan.errorMessage` via `failScan`, and still runs the context-removal cleanup. A scan is marked `completed` only when the active scan itself reached 100% **and** its findings were successfully normalized and persisted — never earlier, and never when persistence fails silently. See [Persistence Lifecycle & Transaction Behavior](#persistence-lifecycle--transaction-behavior).
 
 ### Cancellation
 
@@ -683,7 +810,70 @@ The executor logs (via `console.info`/`console.error`, the same convention `auth
 
 ### What is not implemented
 
-No SentinelScan-native discovery/crawling engine — ZAP's own spider is the only crawler. No SentinelScan-native scanner — ZAP's active scan is the only scan engine. No finding normalization, deduplication, or correlation. No vulnerability database model (raw results are summarized for a log line and discarded, not persisted). No AI analysis. No queue/worker infrastructure (Redis, Kafka, RabbitMQ, BullMQ) — see "Triggering execution" above for what that means in practice.
+No SentinelScan-native discovery/crawling engine — ZAP's own spider is the only crawler. No SentinelScan-native scanner — ZAP's active scan is the only scan engine. No AI analysis or automated remediation. No queue/worker infrastructure (Redis, Kafka, RabbitMQ, BullMQ) — see "Triggering execution" above for what that means in practice. (Finding normalization, deduplication, and persistence *are* implemented as of Stage 5 — see below.)
+
+---
+
+## Findings & Vulnerability Normalization
+
+**Stage 5 gives SentinelScan its own normalized vulnerability model**, independent of any one scanner's schema, and persists it to PostgreSQL. The flow, end to end:
+
+```
+ZAP raw alerts → ZapClient.alerts() → normalizeZapAlerts() → NormalizedFinding[]
+  → FindingRepository.createMany() → Finding + FindingInstance rows in PostgreSQL
+  → (a future stage) AI Security Analyst
+```
+
+### Architectural principle: vendor-neutral, not a ZAP wrapper
+
+`modules/findings/normalized-finding.ts` defines `NormalizedFinding`/`NormalizedFindingInstance` — the *only* contract between a scanner adapter and everything downstream (persistence, the API, a future AI analyst). `modules/findings/zap/zap-alert-normalizer.ts` is the **only** file in the codebase that knows what a raw ZAP alert looks like; it consumes ZAP's shape and produces `NormalizedFinding[]`. A future scanner source would have its own adapter consuming its own raw shape, but producing this exact same type. The persisted `Finding`/`FindingInstance` schema does not mirror ZAP's own field names or terminology anywhere except `source`/`sourceRuleId`, which exist purely for traceability back to where a finding came from.
+
+### Extending `ZapClient` for individual alerts
+
+Stage 4's `ZapClient.alertSummary()` only ever called ZAP's `/JSON/alert/view/alertsSummary/` — a per-risk-level **count**, not individual alerts. Stage 5 adds `ZapClient.alerts(baseUrl)`, calling `/JSON/core/view/alerts/`, ZAP's endpoint for individual raw alert occurrences. Its response shape was confirmed empirically against a live ZAP 2.17.0 daemon (a full spider + active-scan cycle against a controlled local nginx target), not guessed — see `modules/findings/zap/zap-alert.ts`'s `ZapRawAlert` type for the confirmed field list and the quirks worth knowing (`cweid`/`wascid` are strings where `"0"` means "not set"; `reference` is one newline-delimited string, not an array; `pluginId`, not `alertRef`, is the stable rule identifier).
+
+### Severity mapping
+
+`modules/findings/zap/zap-severity-mapping.ts` centralizes ZAP's `risk` string → `FindingSeverity` (`critical` / `high` / `medium` / `low` / `informational`) in one lookup table, matched case-insensitively: `High→high`, `Medium→medium`, `Low→low`, `Informational→informational` (`Critical→critical` is wired in for a future ZAP risk tier, though ZAP does not currently emit one). An unrecognized or missing value never crashes a scan — it falls back to the documented, conservative `FALLBACK_SEVERITY = "medium"` (not `informational`, which would risk understating a real vulnerability; not `critical`/`high`, which would risk overstating one for a merely-unrecognized label).
+
+### Confidence mapping
+
+`modules/findings/zap/zap-confidence-mapping.ts` maps ZAP's `confidence` string → `FindingConfidence` (`high` / `medium` / `low` / `unknown`): `High→high`, `Medium→medium`, `Low→low`, `Confirmed→high`, and ZAP's `False Positive` label → `unknown` (a false-positive marking is a claim the finding is *wrong*, not merely uncertain — SentinelScan's confidence scale has no matching tier, so it becomes `unknown` rather than being silently folded into `low`). Confidence information is never discarded; an unrecognized or missing value becomes the documented `FALLBACK_CONFIDENCE = "unknown"`.
+
+### Category mapping
+
+`modules/findings/zap/zap-category-mapping.ts` maps ZAP's stable `pluginId` (never the human-readable alert name — names have changed across ZAP versions) to one of `FINDING_CATEGORIES` (`modules/findings/finding-category.ts`): `injection`, `authentication`, `authorization`, `cryptography`, `security-misconfiguration`, `sensitive-data-exposure`, `security-header`, `client-side`, `server-side`, `information-disclosure`, `other`. This is a curated, deliberately incomplete mapping of ZAP's common default rules — not an attempt to enumerate every rule ZAP ships. An unmapped `pluginId` becomes `"other"`, and the finding's `sourceRuleId` (the same `pluginId`) is always preserved, so no rule's origin is ever lost even when its category isn't yet known. Extending the table for a newly-encountered `pluginId` is a one-line addition.
+
+### Deduplication strategy
+
+A `Finding` is **one logical vulnerability/rule for one scan** — not one occurrence. Raw alerts are grouped by `pluginId` (falling back to the alert's own name, with a `null sourceRuleId`, on the rare malformed alert missing even that) before normalization; each group becomes exactly one `NormalizedFinding`, carrying one `FindingInstance` per distinct occurrence (URL/method/parameter/attack/evidence combination) within that group. Exact-duplicate raw alert entries (ZAP occasionally reports the identical occurrence twice) collapse into a single instance. When a group's raw alerts disagree on risk/confidence (not expected in practice, but never assumed), the group's overall severity/confidence is the **worst-case** (highest-ranked) value seen, so a real elevated-severity occurrence can never be silently hidden behind a lower one.
+
+Two rules distinct findings must never violate:
+- **Same rule, same scan → one `Finding`.** The database backstops this with `@@unique([scanId, source, sourceRuleId])` on `Finding` — defensive, not the primary correctness mechanism (that's the grouping above), since `createMany` only ever runs once per scan in normal operation.
+- **Same rule, different scans → separate `Finding` rows, always.** Findings are never deduplicated globally across scans; each scan is its own historical record of what was true when it ran. Distinct rules that merely share a similar name (e.g. ZAP's several separate `SQL Injection - <database>` variants) are never merged — grouping is by `pluginId`, never by string-matching on the name.
+
+### Sanitization
+
+`lib/sanitize-text.ts` sanitizes every free-text field a `Finding`/`FindingInstance` stores, applied by the normalizer before anything is persisted — never applied again at read time, since the frontend is expected to render these fields as plain text, never as HTML (scanner output is untrusted data, not markup). Two rules, in order:
+
+1. **Redact credential-like content**, preferring redaction over truncation (a truncated secret can still leak enough to be useful). Covers `Authorization`/`Cookie`/`Set-Cookie`/`Proxy-Authorization` headers (the header name stays visible, only the value is redacted) and generic `key=value` / `key: "value"` / `"key": "value"` pairs for api-key/access-key/secret/token/bearer/password/passwd/pwd/session-id-shaped keys, wherever they appear in a string (a URL query string, a JSON-looking evidence blob, not just at a line start).
+2. **Cap length**, applied *after* redaction — so a would-be-secret sitting right at the truncation boundary is still fully redacted rather than half-truncated into something that looks safe but isn't.
+
+Reference lists are additionally bounded in count (so a hostile/malformed scanner response can't produce an unbounded array) and each entry is length-capped and blank-filtered. Nothing raw is ever stored: no full HTTP request/response bodies, no cookies, no Authorization headers, no passwords, tokens, or session identifiers — and, per the "no giant speculative raw storage" decision, the complete raw ZAP alert JSON is **not** persisted anywhere either; the normalized model is the only stored representation.
+
+### Persistence lifecycle & transaction behavior
+
+A `Scan` now reaches `completed` only once **both** of these have happened: the ZAP active scan itself reached 100%, **and** its findings were successfully normalized and persisted. A scan that finished ZAP execution successfully but failed to persist its findings is reported `failed`, never `completed` with findings silently missing — `ZapScanExecutor` calls `FindingRepository.createMany` strictly before `completeScan`, and lets any persistence error fall through to the same failure-handling path as a ZAP error.
+
+`FindingRepository.createMany` wraps every `Finding` (and its `FindingInstance` rows) for one scan in a single Prisma `$transaction`: either all of a scan's findings land, or none do — there is no scenario where a scan ends up with a partial, inconsistent set of findings. This transaction covers only the persistence/finalization phase; it is never held open across ZAP execution itself (the crawl and active scan, which can run for minutes to hours, happen entirely before this call). An empty `rawAlerts` result (a clean scan) normalizes to `[]` and persists zero rows — a legitimate, successful outcome, not an error.
+
+### Finding counts
+
+`GET /scans/:scanId/findings` returns a `counts` object (`critical`/`high`/`medium`/`low`/`informational`/`total`) computed live from the persisted `Finding` table via `FindingRepository.countsForScan` — never from ZAP's own alert-summary log (which Stage 5 no longer calls at all), and never duplicated as denormalized state on the `Scan` row itself. `counts` is always the scan's full, unfiltered breakdown, independent of any `severity`/`confidence`/`category`/`source` filter applied to the `findings` list in the same response.
+
+### What is not implemented
+
+No AI/LLM analysis of findings, no embeddings or vector database, no automated remediation, no endpoint-discovery engine, no SentinelScan-native vulnerability scanner. ZAP remains the only scan/finding source; the normalized model above is what makes adding a second source later a matter of writing one more adapter, not a schema change.
 
 ---
 

@@ -1,5 +1,11 @@
 import { vi } from "vitest";
-import { ZapRequestError, type ZapAlertSummary, type ZapClient, type ZapHealth } from "../../src/lib/zap-client.js";
+import {
+  ZapRequestError,
+  type ZapAlertRecord,
+  type ZapAlertSummary,
+  type ZapClient,
+  type ZapHealth,
+} from "../../src/lib/zap-client.js";
 
 /**
  * A hand-written `ZapClient` test double with fully controllable, synchronous
@@ -22,12 +28,15 @@ export class FakeZapClient implements ZapClient {
   readonly startActiveScanCalls: Array<{ url: string; contextId: string }> = [];
   readonly stopActiveScanCalls: string[] = [];
   readonly alertSummaryCalls: string[] = [];
+  readonly alertsCalls: string[] = [];
 
   healthResult: ZapHealth = { reachable: true, version: "fake-2.14.0" };
 
   spiderProgress: number[] = [100];
   activeScanProgress: number[] = [100];
   alertSummaryResult: ZapAlertSummary[] = [{ risk: "Medium", count: 1 }];
+  /** Defaults to a clean scan — override per test to script specific raw ZAP alerts. */
+  alertsResult: ZapAlertRecord[] = [];
 
   failCreateContext = false;
   failStartSpider = false;
@@ -107,5 +116,11 @@ export class FakeZapClient implements ZapClient {
     this.alertSummaryCalls.push(baseUrl);
     if (this.onAlertSummary) await this.onAlertSummary();
     return this.alertSummaryResult;
+  }
+
+  async alerts(baseUrl: string): Promise<ZapAlertRecord[]> {
+    this.alertsCalls.push(baseUrl);
+    if (this.onAlertSummary) await this.onAlertSummary();
+    return this.alertsResult;
   }
 }

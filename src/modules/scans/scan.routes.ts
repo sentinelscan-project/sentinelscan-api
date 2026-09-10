@@ -2,6 +2,9 @@ import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from "fastif
 import { UnauthorizedError } from "../../lib/errors.js";
 import { parseOrThrow } from "../../lib/validation.js";
 import { toPublicScan } from "../../repositories/scan.repository.js";
+import { toPublicFinding } from "../../repositories/finding.repository.js";
+import { listFindingsQuerySchema } from "../findings/finding.schemas.js";
+import { listFindingsForScan } from "../findings/finding.service.js";
 import { listScansQuerySchema, scanIdParamsSchema } from "./scan.schemas.js";
 import { cancelScan, getScan, listScans } from "./scan.service.js";
 
@@ -61,5 +64,28 @@ export const scanRoutes: FastifyPluginAsync = async (fastify: FastifyInstance) =
     const params = parseOrThrow(scanIdParamsSchema, request.params);
     const scan = await cancelScan(fastify.scanRepository, ownerId, params.id);
     return reply.status(200).send({ scan: toPublicScan(scan) });
+  });
+
+  // Nested under its parent scan, mirroring `target.routes.ts`'s nesting of
+  // `POST /targets/:targetId/scans`. `:id` here is the scan id (reusing
+  // `scanIdParamsSchema`, the same params shape `GET /scans/:id` already uses).
+  fastify.get("/:id/findings", async (request, reply) => {
+    const ownerId = requireOwnerId(request);
+    const params = parseOrThrow(scanIdParamsSchema, request.params);
+    const query = parseOrThrow(listFindingsQuerySchema, request.query);
+    const result = await listFindingsForScan(
+      fastify.scanRepository,
+      fastify.findingRepository,
+      ownerId,
+      params.id,
+      query,
+    );
+    return reply.status(200).send({
+      findings: result.findings.map(toPublicFinding),
+      counts: result.counts,
+      limit: query.limit,
+      offset: query.offset,
+      hasMore: result.hasMore,
+    });
   });
 };

@@ -2,6 +2,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { ZapScanExecutor } from "../src/modules/scans/zap-scan-executor.js";
 import { FakeZapClient } from "./helpers/fake-zap-client.js";
 import { createInMemoryScanRepository, type InMemoryScanRepository } from "./helpers/in-memory-scan.repository.js";
+import {
+  createInMemoryFindingRepository,
+  type InMemoryFindingRepository,
+} from "./helpers/in-memory-finding.repository.js";
 import { cancelScan } from "../src/modules/scans/scan.service.js";
 
 const FAST_CONFIG = {
@@ -12,6 +16,7 @@ const FAST_CONFIG = {
 };
 
 let scans: InMemoryScanRepository;
+let findings: InMemoryFindingRepository;
 let zap: FakeZapClient;
 let executor: ZapScanExecutor;
 
@@ -22,8 +27,9 @@ async function seedScan(targetUrl = "https://example.com/"): Promise<{ scanId: s
 
 beforeEach(() => {
   scans = createInMemoryScanRepository();
+  findings = createInMemoryFindingRepository();
   zap = new FakeZapClient();
-  executor = new ZapScanExecutor(zap, scans, FAST_CONFIG);
+  executor = new ZapScanExecutor(zap, scans, findings, FAST_CONFIG);
   // The executor logs via plain console.* (see its module comment for why:
   // it runs outside any Fastify request context). Quiet that here so the
   // test run's output stays readable; nothing in this file asserts on it.
@@ -82,13 +88,48 @@ describe("execution — happy path", () => {
     expect(order).toEqual(["spiderStatus", "spiderStatus", "spiderStatus", "startActiveScan"]);
   });
 
-  it("collects a raw alert summary before completing", async () => {
+  it("fetches raw alerts and persists normalized findings before completing", async () => {
     const { scanId, targetId, targetUrl } = await seedScan();
-    zap.alertSummaryResult = [{ risk: "High", count: 2 }];
+    zap.alertsResult = [
+      {
+        alert: "SQL Injection",
+        name: "SQL Injection",
+        risk: "High",
+        confidence: "Medium",
+        description: "SQL injection may be possible.",
+        solution: "Use parameterized queries.",
+        reference: "https://example.org/sqli",
+        pluginId: "40018",
+        cweid: "89",
+        wascid: "19",
+        url: `${targetUrl}search?q=1`,
+        method: "GET",
+        param: "q",
+        attack: "1' OR '1'='1",
+        evidence: "SQL syntax error",
+      },
+    ];
 
     await executor.execute({ scanId, targetId, targetUrl });
 
-    expect(zap.alertSummaryCalls).toEqual([targetUrl]);
+    expect(zap.alertsCalls).toEqual([targetUrl]);
+    const persisted = [...findings.rows.values()];
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0].scanId).toBe(scanId);
+    expect(persisted[0].sourceRuleId).toBe("40018");
+    expect(persisted[0].severity).toBe("high");
+    expect(persisted[0].instances).toHaveLength(1);
+  });
+
+  it("completes with zero findings for a clean scan", async () => {
+    const { scanId, targetId, targetUrl } = await seedScan();
+    zap.alertsResult = [];
+
+    await executor.execute({ scanId, targetId, targetUrl });
+
+    const final = await scans.findById(scanId);
+    expect(final?.status).toBe("completed");
+    expect([...findings.rows.values()]).toHaveLength(0);
   });
 
   it("scopes the ZAP context to the target's origin", async () => {
@@ -143,10 +184,22 @@ describe("failure handling", () => {
     expect(final?.status).toBe("failed");
   });
 
+  it("marks the scan failed (never completed) when finding persistence fails after a successful ZAP run", async () => {
+    const { scanId, targetId, targetUrl } = await seedScan();
+    zap.alertsResult = [{ alert: "XSS", name: "XSS", risk: "Medium", confidence: "High", pluginId: "40012" }];
+    findings.failNextCreateMany = true;
+
+    await executor.execute({ scanId, targetId, targetUrl });
+
+    const final = await scans.findById(scanId);
+    expect(final?.status).toBe("failed");
+    expect([...findings.rows.values()]).toHaveLength(0);
+  });
+
   it("marks the scan failed when the crawl exceeds its timeout", async () => {
     const { scanId, targetId, targetUrl } = await seedScan();
     zap.spiderProgress = [10]; // never advances
-    const shortTimeoutExecutor = new ZapScanExecutor(zap, scans, { ...FAST_CONFIG, crawlTimeoutMs: 10 });
+    const shortTimeoutExecutor = new ZapScanExecutor(zap, scans, findings, { ...FAST_CONFIG, crawlTimeoutMs: 10 });
 
     await shortTimeoutExecutor.execute({ scanId, targetId, targetUrl });
 

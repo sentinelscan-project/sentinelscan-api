@@ -18,6 +18,9 @@ import type { TargetRepository } from "./repositories/target.repository.js";
 import { scanRoutes } from "./modules/scans/scan.routes.js";
 import { prismaScanRepository } from "./repositories/prisma-scan.repository.js";
 import type { ScanRepository } from "./repositories/scan.repository.js";
+import { findingRoutes } from "./modules/findings/finding.routes.js";
+import { prismaFindingRepository } from "./repositories/prisma-finding.repository.js";
+import type { FindingRepository } from "./repositories/finding.repository.js";
 import { defaultZapClient, type ZapClient } from "./lib/zap-client.js";
 import { ZapScanExecutor } from "./modules/scans/zap-scan-executor.js";
 import type { ScanExecutor } from "./modules/scans/scan-executor.js";
@@ -45,6 +48,10 @@ export interface BuildAppOptions {
    */
   scanRepository?: ScanRepository;
   /**
+   * Persistence boundary for findings. Defaults to the Prisma-backed repository.
+   */
+  findingRepository?: FindingRepository;
+  /**
    * ZAP HTTP client. Defaults to a real client pointed at `env.ZAP_BASE_URL`.
    * Tests inject a fake implementation so the suite needs no ZAP daemon.
    */
@@ -66,12 +73,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     emailService = defaultEmailService,
     targetRepository = prismaTargetRepository,
     scanRepository = prismaScanRepository,
+    findingRepository = prismaFindingRepository,
     zapClient = defaultZapClient,
   } = options;
 
   const scanExecutor =
     options.scanExecutor ??
-    new ZapScanExecutor(zapClient, scanRepository, {
+    new ZapScanExecutor(zapClient, scanRepository, findingRepository, {
       crawlTimeoutMs: env.ZAP_CRAWL_TIMEOUT_MS,
       activeScanTimeoutMs: env.ZAP_ACTIVE_SCAN_TIMEOUT_MS,
       overallTimeoutMs: env.ZAP_OVERALL_SCAN_TIMEOUT_MS,
@@ -93,6 +101,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   app.decorate("emailService", emailService);
   app.decorate("targetRepository", targetRepository);
   app.decorate("scanRepository", scanRepository);
+  app.decorate("findingRepository", findingRepository);
   app.decorate("zapClient", zapClient);
   app.decorate("scanExecutor", scanExecutor);
 
@@ -159,6 +168,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   app.register(authRoutes, { prefix: "/auth" });
   app.register(targetRoutes, { prefix: "/targets" });
   app.register(scanRoutes, { prefix: "/scans" });
+  app.register(findingRoutes, { prefix: "/findings" });
 
   return app;
 }
