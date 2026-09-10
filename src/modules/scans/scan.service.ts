@@ -7,6 +7,7 @@ import type {
   ScanRepository,
   ScanStatus,
 } from "../../repositories/scan.repository.js";
+import type { ScanExecutor } from "./scan-executor.js";
 import type { ListScansQuery } from "./scan.schemas.js";
 
 /**
@@ -54,17 +55,32 @@ function invalidTransitionError(from: ScanStatus, to: ScanStatus): ConflictError
 }
 
 /**
- * Creates a queued scan against a target the caller owns.
+ * Creates a queued scan against a target the caller owns, and hands it to
+ * `scanExecutor` for execution.
  *
  * Ownership and the active-status check both happen before any write: the
  * target lookup is itself owner-scoped (Stage 2's `findByIdForOwner`), so a
  * target belonging to someone else is indistinguishable from one that does
  * not exist. `requestedById` is always `ownerId` — the authenticated caller
  * — never anything the request body could influence.
+ *
+ * Execution is deliberately **not** awaited. A real scan (crawl + active
+ * scan against a live target) can run for minutes; `POST
+ * /targets/:targetId/scans` must return as soon as the `Scan` row exists,
+ * not block for the scan's entire duration. This differs from
+ * `auth.service.ts`'s verification email, which *is* awaited — a send
+ * that's expected to take milliseconds is a very different tradeoff from a
+ * scan that can run for the better part of an hour. Any failure to even
+ * *start* execution is caught here and logged rather than thrown: the scan
+ * was successfully created and queued, which is what the caller asked for
+ * and what the HTTP response reports: the executor's own job is to record
+ * its own outcome (`failScan`, eventually) if something goes wrong, not to
+ * fail the request that already returned.
  */
 export async function createScan(
   targetRepository: TargetRepository,
   scanRepository: ScanRepository,
+  scanExecutor: ScanExecutor,
   ownerId: string,
   targetId: string,
 ): Promise<ScanRecord> {
@@ -76,7 +92,18 @@ export async function createScan(
     throw targetNotActiveError();
   }
 
-  return scanRepository.create({ targetId, requestedById: ownerId });
+  const scan = await scanRepository.create({ targetId, requestedById: ownerId });
+
+  void scanExecutor
+    .execute({ scanId: scan.id, targetId: target.id, targetUrl: target.url })
+    .catch((err: unknown) => {
+      console.error(
+        `[ScanService] Unhandled error dispatching scan execution for scan ${scan.id}:`,
+        err instanceof Error ? err.message : "Unknown error",
+      );
+    });
+
+  return scan;
 }
 
 function toRepositoryFilters(query: ListScansQuery): ListScansFilters {

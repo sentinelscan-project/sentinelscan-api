@@ -1,9 +1,9 @@
 # SentinelScan API (`sentinelscan-api`)
 
 ## Overview
-`sentinelscan-api` is the backend API service for **SentinelScan**. Built with Fastify and TypeScript, it provides the core API foundation, environment configuration validation with Zod, PostgreSQL persistence using Prisma, identity and authentication, authorized target management, scan orchestration, centralized logging and error handling, and container packaging.
+`sentinelscan-api` is the backend API service for **SentinelScan**. Built with Fastify and TypeScript, it provides the core API foundation, environment configuration validation with Zod, PostgreSQL persistence using Prisma, identity and authentication, authorized target management, scan orchestration backed by a real OWASP ZAP integration, centralized logging and error handling, and container packaging.
 
-> **Stage 3 Notice**: This repository currently implements the backend foundation (Stage 0), identity and authentication (Stage 1), target registration/management (Stage 2), and scan orchestration (Stage 3). **Stage 3 establishes scan orchestration only — actual scanning is not implemented yet.** Creating a scan persists a `Scan` row with `status: "queued"` and nothing more: no crawling, no HTTP requests to the target, no DNS resolution, no OWASP ZAP integration. A scan simply stays `queued` — there is no code path anywhere in this repository that ever advances it to `running`. OWASP ZAP integration (Stage 4) will introduce the executor that actually does that. `User`, `Target` and `Scan` are the only domain models so far; later stages will attach findings, AI analyses and reports to `Scan`.
+> **Stage 4 Notice**: This repository currently implements the backend foundation (Stage 0), identity and authentication (Stage 1), target registration/management (Stage 2), scan orchestration (Stage 3), and **real OWASP ZAP execution (Stage 4)**. Creating a scan now actually crawls and active-scans the target through a ZAP daemon reachable over the internal Docker network — see [OWASP ZAP Integration](#owasp-zap-integration) below for the target-safety policy, scope enforcement, timeouts, cancellation, and concurrency model this relies on. What Stage 4 deliberately does **not** do: it does not persist findings (raw ZAP results are logged as a summary and discarded, not stored), does not normalize or correlate anything, and does not run any AI analysis. There is also no SentinelScan-native discovery engine or scanner yet — ZAP is the only scan engine. `User`, `Target` and `Scan` are still the only domain models; later stages will attach findings, AI analyses and reports to `Scan`.
 
 ---
 
@@ -16,6 +16,8 @@
 - **Authentication**: `@fastify/jwt` + `@fastify/cookie` (HttpOnly session cookies)
 - **Password Hashing**: bcrypt (`bcryptjs`)
 - **OAuth / OIDC**: `@fastify/oauth2` + `google-auth-library`
+- **Security Scanning Engine**: OWASP ZAP daemon (`ghcr.io/zaproxy/zaproxy`), driven via its JSON HTTP API — no ZAP client SDK dependency, just native `fetch`
+- **IP range classification (SSRF policy)**: `ipaddr.js`
 - **Testing**: Vitest
 - **Linting**: ESLint
 - **Containerization**: Docker (multi-stage)
@@ -36,13 +38,15 @@ sentinelscan-api/
 │   ├── db/
 │   │   └── prisma.ts         # Lazy Prisma client singleton
 │   ├── lib/
-│   │   ├── email-service.ts  # Verification email delivery (development / Resend)
-│   │   ├── email.ts          # Email normalization
-│   │   ├── errors.ts         # AppError hierarchy with HTTP status codes
-│   │   ├── password.ts       # bcrypt hashing / verification
-│   │   ├── prisma-errors.ts  # Unique-constraint & foreign-key-constraint detection
-│   │   ├── url.ts            # Target URL validation & normalization
-│   │   └── validation.ts     # Zod → 400 ValidationError bridge
+│   │   ├── email-service.ts    # Verification email delivery (development / Resend)
+│   │   ├── email.ts            # Email normalization
+│   │   ├── errors.ts           # AppError hierarchy with HTTP status codes
+│   │   ├── password.ts         # bcrypt hashing / verification
+│   │   ├── prisma-errors.ts    # Unique-constraint & foreign-key-constraint detection
+│   │   ├── target-safety.ts    # SSRF policy: is this URL safe to hand to ZAP?
+│   │   ├── url.ts              # Target URL validation, normalization & scope-regex builder
+│   │   ├── validation.ts       # Zod → 400 ValidationError bridge
+│   │   └── zap-client.ts       # ZapClient interface + HTTP implementation
 │   ├── modules/
 │   │   ├── auth/
 │   │   │   ├── auth.routes.ts    # /auth/register, /login, /verify-email, /me, /logout, ...
@@ -54,10 +58,11 @@ sentinelscan-api/
 │   │   │   ├── target.schemas.ts # Zod request schemas & URL normalization wiring
 │   │   │   └── target.service.ts # Ownership-enforced create/list/get/update/delete
 │   │   └── scans/
-│   │       ├── scan.routes.ts    # GET /scans, GET /scans/:id, POST /scans/:id/cancel
-│   │       ├── scan.schemas.ts   # Zod request schemas, list-query pagination
-│   │       ├── scan.service.ts   # Lifecycle state machine, ownership-enforced operations
-│   │       └── scan-executor.ts  # ScanExecutor interface Stage 4 will implement with ZAP
+│   │       ├── scan.routes.ts        # GET /scans, GET /scans/:id, POST /scans/:id/cancel
+│   │       ├── scan.schemas.ts       # Zod request schemas, list-query pagination
+│   │       ├── scan.service.ts       # Lifecycle state machine, ownership-enforced operations
+│   │       ├── scan-executor.ts      # ScanExecutor interface + inert NotImplementedScanExecutor
+│   │       └── zap-scan-executor.ts  # The real Stage 4 executor: ZapClient-driven, mutex-serialized
 │   ├── plugins/
 │   │   └── authentication.ts # JWT + cookie session, `authenticate` preHandler
 │   ├── repositories/
@@ -69,19 +74,24 @@ sentinelscan-api/
 │   │   ├── scan.repository.ts          # ScanRepository interface & PublicScan
 │   │   └── prisma-scan.repository.ts   # Prisma implementation (atomic CAS transitions)
 │   ├── routes/
-│   │   └── health.ts         # GET /health endpoint
+│   │   └── health.ts         # GET /health, GET /health/zap
 │   └── types/
 │       └── fastify.d.ts      # Fastify/JWT type augmentation
 ├── tests/
 │   ├── helpers/
 │   │   ├── in-memory-user.repository.ts   # Database-free User/token/email test doubles
 │   │   ├── in-memory-target.repository.ts # Database-free TargetRepository for tests
-│   │   └── in-memory-scan.repository.ts   # Database-free ScanRepository (reproduces CAS semantics)
-│   ├── auth.test.ts          # Registration, verification, login, session, logout tests
-│   ├── google-auth.test.ts   # Google identity & unconfigured-provider tests
-│   ├── targets.test.ts       # Target CRUD, ownership isolation, validation tests
-│   ├── scans.test.ts         # Scan orchestration, lifecycle, ownership isolation tests
-│   └── health.test.ts        # Vitest integration test
+│   │   ├── in-memory-scan.repository.ts   # Database-free ScanRepository (reproduces CAS semantics)
+│   │   ├── fake-zap-client.ts             # Scriptable ZapClient test double (no real HTTP)
+│   │   └── fake-scan-executor.ts          # No-op ScanExecutor so orchestration tests don't touch ZAP
+│   ├── auth.test.ts              # Registration, verification, login, session, logout tests
+│   ├── google-auth.test.ts       # Google identity & unconfigured-provider tests
+│   ├── targets.test.ts           # Target CRUD, ownership isolation, validation tests
+│   ├── scans.test.ts             # Scan orchestration, lifecycle, ownership isolation tests
+│   ├── target-safety.test.ts     # SSRF policy: IP ranges, DNS resolution, DNS-rebinding awareness
+│   ├── zap-client.test.ts        # HttpZapClient against a mocked fetch
+│   ├── zap-scan-executor.test.ts # Full execution lifecycle against a fake ZapClient
+│   └── health.test.ts            # /health and /health/zap tests
 ├── .dockerignore
 ├── .env.example
 ├── .gitignore
@@ -115,14 +125,23 @@ cp .env.example .env
 | :--- | :--- | :--- |
 | `PORT` | Listening port for the API server | `4000` |
 | `DATABASE_URL` | Neon PostgreSQL database connection string | `postgresql://user:pass@ep-pooler.us-east-2.aws.neon.tech/sentinelscan?sslmode=require` |
-| `ZAP_SERVICE_URL` | Base URL of the internal `sentinelscan-zap` service | `http://localhost:8080` |
 | `JWT_SECRET` | **Required.** Signing key for session JWTs, minimum 32 characters | *(no default — generate one)* |
 | `JWT_EXPIRES_IN` | Session token lifetime, in `jsonwebtoken` duration syntax | `1d` |
 | `AUTH_COOKIE_NAME` | Name of the HttpOnly session cookie | `sentinelscan_token` |
 | `WEB_APP_URL` | Browser origin of the web app; CORS allowlist and post-OAuth redirect target | `http://localhost:3000` |
-| `GOOGLE_CLIENT_ID` | Google OAuth 2.0 client ID *(optional)* | *(unset)* |
+| `GOOGLE_CLIENT_ID` | Google OAuth 2.0 client ID *(optional, must be set with the two below)* | *(unset)* |
 | `GOOGLE_CLIENT_SECRET` | Google OAuth 2.0 client secret *(optional)* | *(unset)* |
 | `GOOGLE_CALLBACK_URL` | Authorized redirect URI registered with Google *(optional)* | `http://localhost:4000/auth/google/callback` |
+| `EMAIL_PROVIDER` | `development` (logs the link) or `resend` (real delivery) | `development` |
+| `EMAIL_FROM` | From address used for outgoing verification email | `SentinelScan <noreply@sentinelscan.io>` |
+| `RESEND_API_KEY` | Resend API key *(required only when `EMAIL_PROVIDER=resend`)* | *(unset)* |
+| `ZAP_BASE_URL` | **Required.** Base URL of the ZAP daemon's JSON API | `http://owasp-zap:8090` in Docker; `http://localhost:8090` locally |
+| `ZAP_API_KEY` | ZAP API key *(optional — only if ZAP's own API-key auth is enabled)* | *(unset)* |
+| `ZAP_HTTP_TIMEOUT_MS` | Per-HTTP-call timeout against ZAP | `10000` |
+| `ZAP_CRAWL_TIMEOUT_MS` | Ceiling on the spider phase | `300000` (5 min) |
+| `ZAP_ACTIVE_SCAN_TIMEOUT_MS` | Ceiling on the active-scan phase | `1800000` (30 min) |
+| `ZAP_OVERALL_SCAN_TIMEOUT_MS` | Ceiling across the whole execution, independent of the two phase timeouts | `2400000` (40 min) |
+| `ZAP_POLL_INTERVAL_MS` | How often the executor polls ZAP for spider/active-scan progress | `2000` |
 
 Generate a signing key with:
 
@@ -294,6 +313,13 @@ All request and response bodies are JSON. Password hashes and signing secrets ar
 ### `GET /health`
 
 Liveness probe. Returns `200 {"status":"ok"}`.
+
+### `GET /health/zap`
+
+Application-level ZAP connectivity check — not a proxy for ZAP's own administration API, which is never exposed through this API. Public, unauthenticated, matching `/health`.
+
+- `200` — `{ "reachable": true, "version": "2.14.0" }`
+- `503` — `{ "reachable": false, "error": "..." }` — a safe, non-sensitive description of the failure; never an API key, and never ZAP's raw response
 
 ### `POST /auth/register`
 
@@ -481,7 +507,7 @@ Creates a scan for this target. See [Scans](#scans) below — this is the scan-c
 
 ### Scans
 
-**Stage 3 establishes scan orchestration only. Actual scanning is not implemented yet.** `POST /targets/:targetId/scans` persists a `Scan` row with `status: "queued"` and returns immediately — nothing crawls the target, nothing calls OWASP ZAP (that is Stage 4), and nothing anywhere in this codebase ever advances a scan to `running` on its own. A queued scan stays queued until a real execution mechanism exists.
+`POST /targets/:targetId/scans` persists a `Scan` row with `status: "queued"` and returns immediately (it does not wait for the scan to run — see [OWASP ZAP Integration](#owasp-zap-integration)). Execution then happens in the background: the target is checked against the SSRF/target-safety policy, a scan-scoped ZAP context is created, the target is crawled, then active-scanned, and the scan reaches a terminal state. Nothing here builds a findings database, normalizes results, or runs AI analysis — see [OWASP ZAP Integration](#owasp-zap-integration) for exactly what Stage 4 does and does not do.
 
 Every `/scans` route requires authentication and is scoped entirely to `request.currentUser.id` as the *requester* — the same non-enumerable-404 rule as targets applies: a scan belonging to another user is indistinguishable from one that does not exist.
 
@@ -501,7 +527,7 @@ queued ──┬──> running ──┬──> completed
 
 This table (`VALID_TRANSITIONS` in `scan.service.ts`) is the single source of truth for every transition check in this codebase; there is no second, separately-maintained list anywhere else. Every transition is applied as an atomic compare-and-swap (`UPDATE ... WHERE status = $expected`) at the database layer, not just checked in application code — so two simultaneous requests to transition the same scan (e.g. two `POST /scans/:id/cancel` calls racing each other) can never both succeed: exactly one wins, the other receives a clean `409 INVALID_SCAN_TRANSITION` rather than a corrupted or double-applied state.
 
-`queued → running`, `running → completed`, and `running → failed` are **not reachable through any HTTP endpoint in Stage 3** — they exist as internal functions in `scan.service.ts` (`startScan`, `completeScan`, `failScan`) for Stage 4's executor to call as a real scan actually progresses, and are covered directly by tests in the meantime. Only `POST /scans/:id/cancel` (below) is reachable over HTTP in this stage, and it only ever moves a scan into `cancelled`.
+`queued → running`, `running → completed`, and `running → failed` are **not reachable through any HTTP endpoint** — they exist as internal functions in `scan.service.ts` (`startScan`, `completeScan`, `failScan`) that only `ZapScanExecutor` calls, as a real scan actually progresses. `POST /scans/:id/cancel` (below) is the only user-facing transition, and it only ever moves a scan into `cancelled`.
 
 #### `GET /scans`
 
@@ -584,6 +610,83 @@ Automated tests never contact Google: account resolution is exercised directly w
 
 ---
 
+## OWASP ZAP Integration
+
+**Stage 4 wires a real ZAP daemon into scan execution.** This section covers the architecture, the SSRF/scope safety boundary, timeouts, cancellation, and concurrency model — and, just as importantly, what this stage deliberately does *not* do. There is no SentinelScan-native discovery engine or scanner (ZAP is the only scan engine so far), no finding normalization or correlation, and no AI analysis. Raw ZAP results are summarized (counts per risk level) for a log line and then discarded — nothing is persisted beyond the `Scan` row's own lifecycle fields.
+
+### Architecture
+
+```
+Next.js  →  Fastify API  →  ScanExecutor (ZapScanExecutor)  →  ZapClient  →  OWASP ZAP daemon  →  authorized target
+```
+
+- **`ZapClient`** (`lib/zap-client.ts`) is a thin interface over ZAP's JSON HTTP API (`/JSON/<component>/<view|action>/<name>/`) — context management, spider, active scan, and an alert summary. Nothing outside this file constructs a ZAP request URL or parses a ZAP response body.
+- **`ZapScanExecutor`** (`modules/scans/zap-scan-executor.ts`) is the real `ScanExecutor` implementation: target-safety check → scoped ZAP context → crawl → active scan → result summary → terminal state, calling `scan.service.ts`'s existing atomic lifecycle functions (`startScan`/`completeScan`/`failScan`) at each step. `NotImplementedScanExecutor` (`scan-executor.ts`) still exists and still throws rather than faking success — it simply is not the default anymore.
+- The API talks to ZAP only over the internal Docker network (`ZAP_BASE_URL=http://owasp-zap:8090` in `docker-compose.yml`). ZAP's administration API port is never published to the host in that configuration — see [Docker](#docker) below.
+
+### Triggering execution — in-process, non-blocking
+
+`POST /targets/:targetId/scans` creates the `Scan` row and returns `201` immediately; it does not wait for the scan to run. `scan.service.ts`'s `createScan` fires `scanExecutor.execute(...)` in the background (`void executor.execute(...).catch(...)`) rather than awaiting it — a real crawl-plus-active-scan can run for the better part of an hour, and the HTTP request must not block for that.
+
+This is an **in-process executor**: it runs inside the same Node process as the rest of the API, with no queue, worker process, or external job system. That is a deliberate, minimal choice suited to this stage and to a single-instance deployment — it is *not* durable across a process restart (a scan that was `running` when the process dies stays `running` forever unless something later reconciles it — nothing in this codebase does that yet) and it does not scale execution across multiple API instances. A durable job queue/worker (e.g. BullMQ, or a dedicated worker process) is the natural next step if and when the API needs to run horizontally — deliberately not introduced yet, per this stage's scope.
+
+### Concurrency & isolation
+
+ZAP is a single shared daemon process. Running two scans through it at the same time risks their spider state, active-scan state, session cookies, or scope bleeding into each other. Rather than pretend the current implementation isolates concurrent ZAP scans safely, `ZapScanExecutor` serializes them: an in-process mutex limits actual ZAP execution to **one scan at a time**, regardless of how many `POST /targets/:targetId/scans` requests arrive concurrently (each still returns `201` immediately; only the background execution is queued). Correctness over throughput, exactly as this stage calls for.
+
+Within that single execution slot, each scan gets its own ZAP context named `sentinelscan-scan-<scanId>`, scoped to the target's origin (see below) and removed in a `finally` block once the scan reaches any terminal state — success, failure, or cancellation — so no scan-specific ZAP state (context, scope, spider/active-scan ids) survives to the next one.
+
+### Target safety policy (SSRF)
+
+Implemented in `lib/target-safety.ts`, and run **only at scan execution time** — never during target creation or update, which remain pure database operations with no network I/O of any kind. A target URL is rejected outright, before any ZAP call, when:
+
+- it doesn't parse, or isn't `http:`/`https:`, or carries embedded credentials (the same rules Stage 2 already enforces at creation, re-checked here defensively);
+- the hostname is `localhost` or `*.localhost`;
+- the hostname (or, for a non-IP hostname, *every* address it resolves to — not just the first) does not classify as ordinary public "unicast" per [`ipaddr.js`](https://www.npmjs.com/package/ipaddr.js)'s range classification. This is an **allow-list, not a deny-list**: loopback, RFC1918 private ranges, link-local (which is what the `169.254.169.254` cloud metadata endpoint falls under — no special case needed), multicast, reserved/unspecified/broadcast, IPv6 unique-local, and IPv6 transition mechanisms that embed an IPv4 address (`ipv4Mapped`, `6to4`, `teredo` — exactly the kind of address that could otherwise smuggle a private IPv4 target past a naive check) are all rejected because they are not "unicast", not because someone enumerated them individually.
+
+**What this cannot guarantee — DNS rebinding.** The address(es) validated here are not necessarily the address ZAP itself connects to: ZAP performs its own independent DNS resolution moments later, in a separate process. A hostname with a very short DNS TTL could legitimately resolve to a public address at check time and to a private address by the time ZAP connects. Closing that gap fully would require routing all of ZAP's outbound traffic through an address-filtering forward proxy (or sharing a resolver between this check and ZAP), which this stage deliberately does not introduce. This is therefore a strong, fail-closed filter against the common cases — literal private/loopback/link-local addresses, static malicious DNS records, IPv4-in-IPv6 smuggling — and an honest, *not* airtight, defense against an attacker who controls DNS specifically to rebind between this check and ZAP's connection.
+
+### Scope policy — conservative same-origin
+
+A `Target`'s authorized scope is exactly its normalized origin (scheme + hostname + effective port, via `URL.origin` — `buildOriginScopeRegex` in `lib/url.ts`). For `https://example.com`, that means `https://example.com/`, `https://example.com/login`, `https://example.com/api/users` are in scope; `https://evil-example.com`, `https://example.com.evil.com`, and `https://sub.example.com` (an unregistered subdomain) are not — scope is never silently broadened to a whole domain or its subdomains.
+
+This regex is handed to ZAP's own `context.includeInContext` action, so scope is enforced by ZAP itself while spidering and active-scanning — not re-implemented by intercepting ZAP's traffic. That also means redirect handling is exactly whatever ZAP's own context-scoping does with out-of-scope redirect targets (it does not queue them for further spidering/scanning); this codebase does not separately inspect or block redirects. Spidering is scoped by `contextName`; the active scan is additionally scoped by `contextId` — scope is not left to the spider alone.
+
+### Scan execution flow
+
+```
+queued
+  → target-safety check (lib/target-safety.ts)
+  → create scan-scoped ZAP context, set origin scope
+  → spider (crawl) the target, polling until 100% or timeout
+  → active scan the target, polling until 100% or timeout
+  → collect a per-risk-level alert count (logged, not persisted)
+  → completed
+  → (finally) remove the ZAP context
+```
+
+A failure at any step — target-safety rejection, ZAP unreachable, a malformed ZAP response, a phase timeout — moves the scan to `failed` with a safe (never-raw) message in `Scan.errorMessage` via `failScan`, and still runs the context-removal cleanup. A scan is marked `completed` only when the active scan itself actually reached 100%, never earlier.
+
+### Cancellation
+
+`POST /scans/:id/cancel` (already implemented in Stage 3) is checked for by the executor at several points: before creating the ZAP context, before starting each phase, and on every poll iteration while a phase is in progress (roughly every `ZAP_POLL_INTERVAL_MS`). When a cancellation is observed mid-phase, the executor attempts to stop the corresponding ZAP operation (`spider/action/stop` or `ascan/action/stop`) **best-effort**: ZAP does not guarantee immediate termination, and a failure to stop it is logged and otherwise ignored, never escalated into a scan failure. The ZAP context is still removed in `finally` either way.
+
+**The race this matters for**: ZAP finishing at the same moment a user cancels. Every lifecycle write goes through `scan.service.ts`'s existing atomic compare-and-swap (`UPDATE ... WHERE status = $expected`) — this executor never writes `Scan.status` directly. If `POST /scans/:id/cancel` wins that race, the executor's later `completeScan` call simply fails its own CAS (the row is no longer `running`) and is treated as "already terminal, nothing to do", not as an error — `cancelled` is never overwritten by a late `completed`.
+
+### Timeouts
+
+Four independent ceilings, all configurable (see [Environment Variables](#supported-variables)), none hardcoded: a per-HTTP-call timeout against ZAP (`ZAP_HTTP_TIMEOUT_MS`), a crawl-phase timeout (`ZAP_CRAWL_TIMEOUT_MS`), an active-scan-phase timeout (`ZAP_ACTIVE_SCAN_TIMEOUT_MS`), and an overall ceiling across the whole execution (`ZAP_OVERALL_SCAN_TIMEOUT_MS`), independent of the two phase timeouts. A scan can never run forever: exceeding any timeout is treated the same as a cancellation-triggered stop (best-effort ZAP stop, then `failed`).
+
+### Logging
+
+The executor logs (via `console.info`/`console.error`, the same convention `auth.service.ts` already uses for background side effects outside any Fastify request) execution start, crawl start/complete, active-scan start/complete, the result summary, and completion/failure/cancellation — each tagged with `scanId` and `targetId`. It never logs API keys, cookies, authorization headers, target credentials, or a raw ZAP response body; `ZapClient`'s own error messages are built from the request's endpoint name only, never the full URL (which may carry `apikey` as a query parameter).
+
+### What is not implemented
+
+No SentinelScan-native discovery/crawling engine — ZAP's own spider is the only crawler. No SentinelScan-native scanner — ZAP's active scan is the only scan engine. No finding normalization, deduplication, or correlation. No vulnerability database model (raw results are summarized for a log line and discarded, not persisted). No AI analysis. No queue/worker infrastructure (Redis, Kafka, RabbitMQ, BullMQ) — see "Triggering execution" above for what that means in practice.
+
+---
+
 ## Docker
 
 ### Build the Image
@@ -595,9 +698,11 @@ docker build -t sentinelscan-api .
 ```bash
 docker run -p 4000:4000 \
   -e DATABASE_URL="postgresql://user:pass@ep-pooler.us-east-2.aws.neon.tech/sentinelscan?sslmode=require" \
-  -e ZAP_SERVICE_URL="http://sentinelscan-zap:8080" \
+  -e JWT_SECRET="<a long random value>" \
+  -e ZAP_BASE_URL="http://owasp-zap:8090" \
   sentinelscan-api
 ```
+This assumes `sentinelscan-api` and an `owasp-zap` container share a Docker network (see `docker-compose.yml` at the workspace root, which wires this up directly rather than needing manual flags).
 
 ---
 
@@ -661,4 +766,4 @@ git push -u origin main
 ## Future Deployment Architecture
 - `sentinelscan-api` will be deployed as a container to a Docker-compatible host (e.g., AWS ECS, Render, Railway, or Kubernetes).
 - Connected to a managed Neon PostgreSQL instance via `DATABASE_URL`.
-- Communicates internally with `sentinelscan-zap` over private network via `ZAP_SERVICE_URL`.
+- Communicates directly with an `owasp-zap` daemon over a private network via `ZAP_BASE_URL` — see [OWASP ZAP Integration](#owasp-zap-integration).

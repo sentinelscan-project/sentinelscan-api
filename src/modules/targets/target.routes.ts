@@ -79,7 +79,13 @@ export const targetRoutes: FastifyPluginAsync = async (fastify: FastifyInstance)
   fastify.post("/:targetId/scans", async (request, reply) => {
     const ownerId = requireOwnerId(request);
     const params = parseOrThrow(createScanParamsSchema, request.params);
-    const scan = await createScan(fastify.targetRepository, fastify.scanRepository, ownerId, params.targetId);
+    const scan = await createScan(
+      fastify.targetRepository,
+      fastify.scanRepository,
+      fastify.scanExecutor,
+      ownerId,
+      params.targetId,
+    );
     return reply.status(201).send({ scan: toPublicScan(scan) });
   });
 };

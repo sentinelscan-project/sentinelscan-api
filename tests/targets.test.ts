@@ -12,6 +12,7 @@ import {
   createInMemoryTargetRepository,
   type InMemoryTargetRepository,
 } from "./helpers/in-memory-target.repository.js";
+import { NoOpScanExecutor } from "./helpers/fake-scan-executor.js";
 
 const AUTH_COOKIE = "sentinelscan_token";
 
@@ -74,6 +75,10 @@ beforeAll(async () => {
     tokenRepository: tokens,
     emailService,
     targetRepository: targets,
+    // This module never exercises scan creation, but injecting a no-op here
+    // (rather than letting `buildApp` construct the real ZapScanExecutor)
+    // keeps this suite from depending on ZAP even indirectly.
+    scanExecutor: new NoOpScanExecutor(),
   });
   await app.ready();
 });

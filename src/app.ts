@@ -18,6 +18,9 @@ import type { TargetRepository } from "./repositories/target.repository.js";
 import { scanRoutes } from "./modules/scans/scan.routes.js";
 import { prismaScanRepository } from "./repositories/prisma-scan.repository.js";
 import type { ScanRepository } from "./repositories/scan.repository.js";
+import { defaultZapClient, type ZapClient } from "./lib/zap-client.js";
+import { ZapScanExecutor } from "./modules/scans/zap-scan-executor.js";
+import type { ScanExecutor } from "./modules/scans/scan-executor.js";
 
 export interface BuildAppOptions {
   /**
@@ -41,6 +44,19 @@ export interface BuildAppOptions {
    * Persistence boundary for scans. Defaults to the Prisma-backed repository.
    */
   scanRepository?: ScanRepository;
+  /**
+   * ZAP HTTP client. Defaults to a real client pointed at `env.ZAP_BASE_URL`.
+   * Tests inject a fake implementation so the suite needs no ZAP daemon.
+   */
+  zapClient?: ZapClient;
+  /**
+   * Runs queued scans. Defaults to `ZapScanExecutor` wired to `zapClient` and
+   * `scanRepository`. Tests typically override this directly with a no-op
+   * (or call-recording) executor: `createScan` fires it in the background on
+   * every scan creation, so leaving the real one in place in a test would
+   * mean an uncontrolled attempt to reach ZAP on every such test.
+   */
+  scanExecutor?: ScanExecutor;
 }
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
@@ -50,7 +66,17 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     emailService = defaultEmailService,
     targetRepository = prismaTargetRepository,
     scanRepository = prismaScanRepository,
+    zapClient = defaultZapClient,
   } = options;
+
+  const scanExecutor =
+    options.scanExecutor ??
+    new ZapScanExecutor(zapClient, scanRepository, {
+      crawlTimeoutMs: env.ZAP_CRAWL_TIMEOUT_MS,
+      activeScanTimeoutMs: env.ZAP_ACTIVE_SCAN_TIMEOUT_MS,
+      overallTimeoutMs: env.ZAP_OVERALL_SCAN_TIMEOUT_MS,
+      pollIntervalMs: env.ZAP_POLL_INTERVAL_MS,
+    });
 
   const app = fastify({
     logger: process.env.NODE_ENV === "test" ? false : { level: "info" },
@@ -67,6 +93,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   app.decorate("emailService", emailService);
   app.decorate("targetRepository", targetRepository);
   app.decorate("scanRepository", scanRepository);
+  app.decorate("zapClient", zapClient);
+  app.decorate("scanExecutor", scanExecutor);
 
   app.register(authentication, { userRepository });
 

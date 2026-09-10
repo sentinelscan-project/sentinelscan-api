@@ -42,7 +42,6 @@ const baseEnvSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   PORT: z.coerce.number().default(4000),
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
-  ZAP_SERVICE_URL: z.string().url("ZAP_SERVICE_URL must be a valid URL"),
   JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 characters"),
   JWT_EXPIRES_IN: z.string().min(1).default("1d"),
   AUTH_COOKIE_NAME: z.string().min(1).default("sentinelscan_token"),
@@ -55,6 +54,29 @@ const baseEnvSchema = z.object({
   EMAIL_FROM: z.string().default("SentinelScan <noreply@sentinelscan.io>"),
   EMAIL_API_KEY: optionalNonEmptyString,
   RESEND_API_KEY: optionalNonEmptyString,
+
+  // ---------------------------------------------------------------------
+  // Stage 4: OWASP ZAP integration.
+  //
+  // Talks directly to the ZAP daemon over the internal Docker network (see
+  // docker-compose.yml) — there is no intermediate service. `ZAP_API_KEY` is
+  // optional (the compose ZAP container currently disables key auth via
+  // `api.disablekey=true`) but is supported for any deployment that enables
+  // it; it is only ever attached to outgoing requests server-side and is
+  // never logged or sent to the browser.
+  // ---------------------------------------------------------------------
+  ZAP_BASE_URL: z.string().url("ZAP_BASE_URL must be a valid URL"),
+  ZAP_API_KEY: optionalNonEmptyString,
+  /** Per-HTTP-call timeout against the ZAP daemon. */
+  ZAP_HTTP_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  /** Ceiling on how long the spider phase may run before it is treated as failed. */
+  ZAP_CRAWL_TIMEOUT_MS: z.coerce.number().int().positive().default(5 * 60_000),
+  /** Ceiling on how long the active-scan phase may run before it is treated as failed. */
+  ZAP_ACTIVE_SCAN_TIMEOUT_MS: z.coerce.number().int().positive().default(30 * 60_000),
+  /** Ceiling across the whole execute() call (queued → terminal), independent of the two phase timeouts above. */
+  ZAP_OVERALL_SCAN_TIMEOUT_MS: z.coerce.number().int().positive().default(40 * 60_000),
+  /** How often the executor polls ZAP for spider/active-scan progress. */
+  ZAP_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(2_000),
 });
 
 const envSchema = baseEnvSchema.and(googleOAuthSchema);
@@ -67,7 +89,7 @@ export function parseEnv(customEnv?: Record<string, string | undefined>): Env {
   // Provide safe defaults in test mode if not explicitly set
   if (envToParse.NODE_ENV === "test") {
     envToParse.DATABASE_URL = envToParse.DATABASE_URL || "postgresql://mock:mock@localhost:5432/sentinelscan_test";
-    envToParse.ZAP_SERVICE_URL = envToParse.ZAP_SERVICE_URL || "http://localhost:8080";
+    envToParse.ZAP_BASE_URL = envToParse.ZAP_BASE_URL || "http://localhost:8090";
     envToParse.JWT_SECRET = envToParse.JWT_SECRET || "test-only-jwt-secret-value-not-for-production-use";
   }
 

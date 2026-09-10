@@ -16,6 +16,7 @@ import {
   createInMemoryScanRepository,
   type InMemoryScanRepository,
 } from "./helpers/in-memory-scan.repository.js";
+import { NoOpScanExecutor } from "./helpers/fake-scan-executor.js";
 import { cancelScan, completeScan, failScan, startScan } from "../src/modules/scans/scan.service.js";
 
 const AUTH_COOKIE = "sentinelscan_token";
@@ -26,6 +27,7 @@ let tokens: InMemoryVerificationTokenRepository;
 let emailService: MockEmailService;
 let targets: InMemoryTargetRepository;
 let scans: InMemoryScanRepository;
+let scanExecutor: NoOpScanExecutor;
 
 function cookieValue(response: { cookies: Array<Record<string, unknown>> }, name: string): string | undefined {
   const cookie = response.cookies.find((entry) => entry.name === name);
@@ -88,12 +90,14 @@ beforeAll(async () => {
   emailService = new MockEmailService();
   targets = createInMemoryTargetRepository();
   scans = createInMemoryScanRepository();
+  scanExecutor = new NoOpScanExecutor();
   app = buildApp({
     userRepository: users,
     tokenRepository: tokens,
     emailService,
     targetRepository: targets,
     scanRepository: scans,
+    scanExecutor,
   });
   await app.ready();
 });
@@ -104,6 +108,7 @@ beforeEach(() => {
   emailService.reset();
   targets.reset();
   scans.reset();
+  scanExecutor.reset();
 });
 
 afterAll(async () => {
@@ -177,6 +182,21 @@ describe("POST /targets/:targetId/scans — creation", () => {
     const scanId = JSON.parse(response.payload).scan.id;
     const stored = scans.rows.get(scanId);
     expect(stored?.requestedById).toBe(owner?.id);
+  });
+
+  it("hands the new scan to the configured ScanExecutor", async () => {
+    const session = await createSession("owner-a@example.com");
+    const targetId = await createTarget(session);
+
+    const response = await createScanViaApi(session, targetId);
+    const scanId = JSON.parse(response.payload).scan.id;
+
+    // The executor runs in the background (fire-and-forget); give it a tick
+    // to be invoked before asserting on it.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(scanExecutor.calls).toHaveLength(1);
+    expect(scanExecutor.calls[0]).toMatchObject({ scanId, targetId, targetUrl: "https://staging.acme.example.com/" });
   });
 
   it("ignores a client-supplied requestedById, status, startedAt and completedAt", async () => {

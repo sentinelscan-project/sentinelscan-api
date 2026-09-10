@@ -26,6 +26,10 @@ declare module "fastify" {
     targetRepository: import("../repositories/target.repository.js").TargetRepository;
     /** The scan persistence boundary the app was built with. */
     scanRepository: import("../repositories/scan.repository.js").ScanRepository;
+    /** ZAP HTTP client — never exposed directly to routes beyond `GET /health/zap`. */
+    zapClient: import("../lib/zap-client.js").ZapClient;
+    /** Runs queued scans against ZAP. Defaults to `ZapScanExecutor`. */
+    scanExecutor: import("../modules/scans/scan-executor.js").ScanExecutor;
   }
 
   interface FastifyRequest {
