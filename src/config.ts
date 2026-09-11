@@ -108,7 +108,72 @@ const baseEnvSchema = z.object({
   ANALYSIS_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(8_000),
 });
 
-const envSchema = baseEnvSchema.and(googleOAuthSchema);
+/**
+ * Exact secret values that have appeared as a development/example/local
+ * fallback somewhere in this repository (`.env.example`, `docker-compose.yml`,
+ * this file's own `NODE_ENV=test` default). None of them is a secret in any
+ * meaningful sense — they're all either committed to git or trivially
+ * derivable from it — so accepting any of them in a real production
+ * deployment would mean the signing key is effectively public.
+ */
+const KNOWN_INSECURE_JWT_SECRETS = new Set([
+  "test-only-jwt-secret-value-not-for-production-use",
+  "dev-insecure-jwt-secret-at-least-32-chars-long-for-compose",
+  "replace-with-a-long-random-value-at-least-32-chars",
+]);
+
+/** Catches the common English-word placeholder patterns even if the exact string above isn't matched verbatim. */
+const PLACEHOLDER_SECRET_PATTERN =
+  /insecure|changeme|change-me|placeholder|example|sample|replace-with|your-secret|dev-only|dev-secret|test-secret|todo/i;
+
+/** Substrings that only ever appear in the example/local database URLs shipped in this repo, never a real one. */
+const PLACEHOLDER_DATABASE_URL_PATTERN = /ep-sample-pooler|mock:mock|neon-proxy/i;
+
+/**
+ * Production-only fail-fast checks, layered on top of the schema above via
+ * `superRefine` rather than baked into the field types themselves — every
+ * one of these values is a perfectly valid *shape* (a long-enough string, a
+ * well-formed URL); what makes it unacceptable is specific to running with
+ * `NODE_ENV=production`, so `development`/`test` deliberately skip all of
+ * them (the `NODE_ENV=test` branch in `parseEnv` even relies on one of the
+ * exact strings blocked here). This is what makes "reject development JWT
+ * secrets / insecure placeholder values / invalid production configuration"
+ * an enforced invariant rather than a documentation-only convention — the
+ * process refuses to start rather than silently running insecurely.
+ */
+const envSchema = baseEnvSchema.and(googleOAuthSchema).superRefine((value, ctx) => {
+  if (value.NODE_ENV !== "production") {
+    return;
+  }
+
+  if (KNOWN_INSECURE_JWT_SECRETS.has(value.JWT_SECRET) || PLACEHOLDER_SECRET_PATTERN.test(value.JWT_SECRET)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["JWT_SECRET"],
+      message:
+        "JWT_SECRET looks like a development/example placeholder and must not be used in production. " +
+        "Generate a real secret (see .env.example) and set it in the production environment.",
+    });
+  }
+
+  if (!value.WEB_APP_URL.startsWith("https://")) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["WEB_APP_URL"],
+      message: "WEB_APP_URL must be an https:// URL in production (the deployed frontend's real origin).",
+    });
+  }
+
+  if (PLACEHOLDER_DATABASE_URL_PATTERN.test(value.DATABASE_URL)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["DATABASE_URL"],
+      message:
+        "DATABASE_URL looks like the example/local placeholder from .env.example or docker-compose.yml and must " +
+        "not be used in production. Set the real Neon connection string.",
+    });
+  }
+});
 
 export type Env = z.infer<typeof envSchema>;
 
@@ -134,7 +199,29 @@ export function parseEnv(customEnv?: Record<string, string | undefined>): Env {
       .map((issue) => `  - ${issue.path.join(".")}: ${issue.message}`)
       .join("\n");
     console.error("Critical Configuration Error - Invalid Environment Variables:\n" + errorDetails);
-    throw new Error("Application configuration validation failed. Check environment variables.");
+    // The specific field(s) and reason(s) are included in the thrown message
+    // itself (not just the console.error above) so the failure is legible
+    // from whatever actually surfaces the crash — a process manager's exit
+    // reason, a platform's deploy-failure summary, a test assertion — even
+    // when stdout/stderr logs aren't consulted separately.
+    throw new Error(`Application configuration validation failed:\n${errorDetails}`);
+  }
+
+  // A loud warning, not a fail-fast rejection: unlike JWT_SECRET/WEB_APP_URL/
+  // DATABASE_URL above, whether ZAP actually enforces this key is a fact
+  // about the *separately deployed* ZAP daemon's own configuration, not
+  // something this process can verify — it can only check that it has been
+  // told to send one. Hard-failing boot here would also break the documented
+  // local "run the production Docker image via docker-compose" verification
+  // workflow, which intentionally keeps ZAP unauthenticated
+  // (`api.disablekey=true`) even though nothing about that workflow is a
+  // real production deployment. Never logs the key itself.
+  if (result.data.NODE_ENV === "production" && !result.data.ZAP_API_KEY) {
+    console.warn(
+      "[Config] WARNING: ZAP_API_KEY is not set while NODE_ENV=production. " +
+        "The production ZAP daemon must require API-key authentication (never api.disablekey=true) — " +
+        "see the README's Production Deployment section.",
+    );
   }
 
   return result.data;

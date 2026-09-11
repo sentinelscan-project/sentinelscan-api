@@ -166,19 +166,20 @@ cp .env.example .env
 | Variable | Description | Default / Example |
 | :--- | :--- | :--- |
 | `PORT` | Listening port for the API server | `4000` |
-| `DATABASE_URL` | Neon PostgreSQL database connection string | `postgresql://user:pass@ep-pooler.us-east-2.aws.neon.tech/sentinelscan?sslmode=require` |
-| `JWT_SECRET` | **Required.** Signing key for session JWTs, minimum 32 characters | *(no default — generate one)* |
+| `DATABASE_URL` | Neon PostgreSQL database connection string. **In production**, must not be the example/mock placeholder shipped in this repo — rejected at startup | `postgresql://user:pass@ep-pooler.us-east-2.aws.neon.tech/sentinelscan?sslmode=require` |
+| `JWT_SECRET` | **Required.** Signing key for session JWTs, minimum 32 characters. **In production**, must not be a known development/placeholder value (including the `docker-compose.yml`/`.env.example` defaults) — rejected at startup | *(no default — generate one)* |
 | `JWT_EXPIRES_IN` | Session token lifetime, in `jsonwebtoken` duration syntax | `1d` |
 | `AUTH_COOKIE_NAME` | Name of the HttpOnly session cookie | `sentinelscan_token` |
-| `WEB_APP_URL` | Browser origin of the web app; CORS allowlist and post-OAuth redirect target | `http://localhost:3000` |
+| `WEB_APP_URL` | Browser origin of the web app; CORS allowlist and post-OAuth redirect target. **In production**, must be `https://` — rejected at startup otherwise | `http://localhost:3000` |
 | `GOOGLE_CLIENT_ID` | Google OAuth 2.0 client ID *(optional, must be set with the two below)* | *(unset)* |
 | `GOOGLE_CLIENT_SECRET` | Google OAuth 2.0 client secret *(optional)* | *(unset)* |
 | `GOOGLE_CALLBACK_URL` | Authorized redirect URI registered with Google *(optional)* | `http://localhost:4000/auth/google/callback` |
 | `EMAIL_PROVIDER` | `development` (logs the link) or `resend` (real delivery) | `development` |
 | `EMAIL_FROM` | From address used for outgoing verification email | `SentinelScan <noreply@sentinelscan.io>` |
 | `RESEND_API_KEY` | Resend API key *(required only when `EMAIL_PROVIDER=resend`)* | *(unset)* |
-| `ZAP_BASE_URL` | **Required.** Base URL of the ZAP daemon's JSON API | `http://owasp-zap:8090` in Docker; `http://localhost:8090` locally |
-| `ZAP_API_KEY` | ZAP API key *(optional — only if ZAP's own API-key auth is enabled)* | *(unset)* |
+| `ZAP_BASE_URL` | **Required.** Canonical base URL of the ZAP daemon's JSON API | `http://owasp-zap:8090` in Docker; `http://localhost:8090` locally |
+| `ZAP_SERVICE_URL` | Legacy alias for `ZAP_BASE_URL` from Stage 0, kept only for backward compatibility — set `ZAP_BASE_URL` directly in new configuration | *(unset)* |
+| `ZAP_API_KEY` | ZAP API key. Optional in local development (`api.disablekey=true`); **required in production** — the process still boots without it (this value can't be independently verified against the separately-deployed ZAP daemon), but logs a startup warning. Never logged, never sent to the browser | *(unset)* |
 | `ZAP_HTTP_TIMEOUT_MS` | Per-HTTP-call timeout against ZAP | `10000` |
 | `ZAP_CRAWL_TIMEOUT_MS` | Ceiling on the spider phase | `300000` (5 min) |
 | `ZAP_ACTIVE_SCAN_TIMEOUT_MS` | Ceiling on the active-scan phase | `1800000` (30 min) |
@@ -1311,7 +1312,54 @@ git push -u origin main
 
 ---
 
-## Future Deployment Architecture
-- `sentinelscan-api` will be deployed as a container to a Docker-compatible host (e.g., AWS ECS, Render, Railway, or Kubernetes).
-- Connected to a managed Neon PostgreSQL instance via `DATABASE_URL`.
-- Communicates directly with an `owasp-zap` daemon over a private network via `ZAP_BASE_URL` — see [OWASP ZAP Integration](#owasp-zap-integration).
+## Production Deployment (Render + Vercel)
+
+The intended production topology:
+
+```
+Vercel                          Render                         Neon
+┌────────────────────┐          ┌───────────────────────┐      ┌──────────────┐
+│  sentinelscan-web   │  HTTPS   │  sentinelscan-api      │      │  PostgreSQL  │
+│  (Next.js frontend) │ ───────▶ │  (this repo, Dockerfile)│────▶│              │
+└────────────────────┘          │                         │      └──────────────┘
+                                 │  private network only   │
+                                 │           │              │
+                                 │           ▼              │
+                                 │  sentinelscan-zap        │
+                                 │  (private Render service,│
+                                 │   ZAP API key required)  │
+                                 └───────────────────────┘
+```
+
+`sentinelscan-web` is a static/SSR Next.js app on Vercel; every request it needs served goes to `sentinelscan-api` on Render over HTTPS with credentials (cookies). `sentinelscan-api` is the only thing that ever talks to Neon or to the ZAP daemon — neither is reachable from the browser, from Vercel, or from the public internet.
+
+### LOCAL vs PRODUCTION — the two configurations are deliberately different
+
+| | LOCAL (`docker-compose.yml`, or `npm run dev`) | PRODUCTION (Render + Vercel) |
+| :--- | :--- | :--- |
+| `NODE_ENV` | `development` | `production` (set by Render) |
+| ZAP reachability | Internal Docker network (`owasp-zap:8090`), or `http://localhost:8090` for `npm run dev` | Render **private service** (`sentinelscan-zap:8090`) — no public port |
+| ZAP authentication | `api.disablekey=true` (no key required) | `ZAP_API_KEY` **required** — ZAP configured with `-config api.key=<value>`, never `api.disablekey=true` |
+| `JWT_SECRET` | The committed dev-only compose default, or any 32+ char local value | A real, randomly generated secret — see [Environment Variables](#supported-variables). `config.ts` refuses to boot in production with a known development/placeholder value |
+| Session cookie | `secure: false`, `SameSite=Lax` (works over plain `http://localhost`) | `secure: true`, `SameSite=None` (required for the cross-origin Vercel ↔ Render cookie flow) — see [Authentication → Mechanism](#mechanism) |
+| `WEB_APP_URL` | `http://localhost:3000` | The real Vercel `https://` origin — `config.ts` refuses a non-`https://` value in production |
+| `DATABASE_URL` | Local/disposable Postgres, or a Neon dev branch | The production Neon connection string — `config.ts` refuses the example/mock placeholder values in production |
+
+This is enforced, not just documented: `parseEnv()` (`src/config.ts`) runs a **production-only** validation pass whenever `NODE_ENV=production` and refuses to start the process if `JWT_SECRET` matches a known development/placeholder value, `WEB_APP_URL` isn't `https://`, or `DATABASE_URL` looks like one of the example/mock values shipped in this repo (`.env.example`, `docker-compose.yml`). It also logs a startup warning (not a hard failure, since it can't verify the separately-deployed ZAP daemon's own configuration) if `ZAP_API_KEY` is unset in production. None of these checks run in `development`/`test`, so local work and CI are unaffected.
+
+### What must be configured manually in Render
+
+1. **`sentinelscan-api` web service** — deploy from this repo's `Dockerfile`. Set every required variable from [Environment Variables](#supported-variables) in Render's dashboard: `DATABASE_URL` (the Neon connection string), `JWT_SECRET` (freshly generated, never the compose/example value), `WEB_APP_URL` (the Vercel deployment's `https://` origin), `ZAP_BASE_URL=http://sentinelscan-zap:8090`, `ZAP_API_KEY` (a real value, matching what the ZAP service is configured with), and `GEMINI_API_KEY` if AI analysis is enabled. Do **not** set `LIVE_TARGET_URL` or `RUN_LIVE_INTEGRATION_TEST` — see [Opt-in local live-test access](#opt-in-local-live-test-access); they belong to `tests/live-integration.test.ts` alone and are never read by the application.
+2. **`sentinelscan-zap` private service** — deploy the ZAP image (`ghcr.io/zaproxy/zaproxy:stable`) as a **private** Render service (no public URL) on the same private network as `sentinelscan-api`, with a start command that requires a key: `zap.sh -daemon -host 0.0.0.0 -port 8090 -config api.key=<the same value as ZAP_API_KEY above> -config api.addrs.addr.name=.* -config api.addrs.addr.regex=true`. Never give this service a public Render URL, and never set `api.disablekey=true` here.
+3. **Neon PostgreSQL** — a production Neon project/branch, with `DATABASE_URL` pointing at it. `npx prisma migrate deploy` (already the Dockerfile's `CMD`) applies pending migrations on every deploy; it never resets data.
+4. Confirm Render's health check is pointed at `GET /health` (not `/health/zap`, which reflects ZAP's own reachability and would make the whole API service look unhealthy during a transient ZAP restart).
+
+### What must be configured manually in Vercel
+
+1. Deploy `sentinelscan-web` from its own repository.
+2. Set the frontend's API base URL environment variable to the Render `sentinelscan-api` service's `https://` URL.
+3. No secrets belong in Vercel's environment for this app: `sentinelscan-web` never holds `JWT_SECRET`, `GEMINI_API_KEY`, `ZAP_API_KEY`, or `DATABASE_URL` — every one of those stays server-side on Render, and the frontend talks to `sentinelscan-api` only over plain HTTPS with credentialed cookies.
+
+### Known limitations that don't change for production
+
+Scan execution is still the in-process executor described in [Triggering execution](#triggering-execution--in-process-non-blocking) and [Concurrency & isolation](#concurrency--isolation): it isn't backed by a durable queue, a process restart mid-scan leaves that scan stuck `running` with nothing to reconcile it, and it doesn't scale across multiple `sentinelscan-api` instances. This is an accepted, documented limitation for a single-instance Render deployment — introducing a queue (Redis/BullMQ/etc.) is explicitly out of scope until a concrete requirement (horizontal scaling, or automatic recovery of interrupted scans) makes it necessary.
