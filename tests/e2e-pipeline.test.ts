@@ -14,7 +14,7 @@ import { ZapScanExecutor } from "../src/modules/scans/zap-scan-executor.js";
 import { FakeZapClient } from "./helpers/fake-zap-client.js";
 import { SecurityAnalysisExecutor } from "../src/modules/analysis/security-analysis-executor.js";
 import { FakeSecurityAnalysisModel } from "./helpers/fake-security-analysis-model.js";
-import type { ZapRawAlert } from "../src/modules/findings/zap/zap-alert.js";
+import type { ZapAlertRecord } from "../src/lib/zap-client.js";
 
 const AUTH_COOKIE = "sentinelscan_token";
 
@@ -141,7 +141,7 @@ describe("Stage 8: Full End-to-End Pipeline Integration", () => {
     // Configure Fake ZAP to return realistic raw alerts upon completion
     fakeZap.spiderProgress = [50, 100];
     fakeZap.activeScanProgress = [50, 100];
-    const sampleZapAlerts: ZapRawAlert[] = [
+    const sampleZapAlerts: ZapAlertRecord[] = [
       {
         pluginId: "40012",
         alertRef: "40012-1",
@@ -150,7 +150,6 @@ describe("Stage 8: Full End-to-End Pipeline Integration", () => {
         risk: "High",
         confidence: "High",
         url: "https://example.com/search?query=test",
-        uri: "https://example.com/search?query=test",
         param: "query",
         attack: "<script>alert(1)</script>",
         evidence: "<script>alert(1)</script>",
@@ -170,7 +169,6 @@ describe("Stage 8: Full End-to-End Pipeline Integration", () => {
         risk: "Low",
         confidence: "Medium",
         url: "https://example.com",
-        uri: "https://example.com",
         param: "",
         attack: "",
         evidence: "",
@@ -277,19 +275,18 @@ describe("Stage 8: Full End-to-End Pipeline Integration", () => {
     expect(analysisRecord.id).toBeDefined();
 
     // Wait for analysis executor to complete
-    let completedAnalysis = await analyses.findById(analysisRecord.id);
+    let completedAnalysis = await analyses.findByIdForOwner(analysisRecord.id, aliceUser.id);
     attempts = 0;
     while (completedAnalysis?.status !== "completed" && attempts < 50) {
       await new Promise((resolve) => setTimeout(resolve, 50));
-      completedAnalysis = await analyses.findById(analysisRecord.id);
+      completedAnalysis = await analyses.findByIdForOwner(analysisRecord.id, aliceUser.id);
       attempts++;
     }
     expect(completedAnalysis?.status).toBe("completed");
     expect(completedAnalysis?.overallRisk).toBe("high");
     expect(completedAnalysis?.executiveSummary).toContain("reflected XSS");
-    expect(completedAnalysis?.assessments.length).toBe(1);
-    expect(completedAnalysis?.assessments[0].findingId).toBe(xssFinding.id);
-    expect(completedAnalysis?.assessments[0].priority).toBe("high");
+    expect(completedAnalysis?.assessments).toHaveLength(1);
+    expect(completedAnalysis?.assessments[0]).toMatchObject({ findingId: xssFinding.id, priority: "high" });
 
     // Verify retrieval via GET /scans/:scanId/analysis
     const getAnalysisRes = await app.inject({

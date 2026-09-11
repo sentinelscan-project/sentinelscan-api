@@ -127,11 +127,13 @@ export function safeMessage(err: unknown): string {
 
 export class GeminiSecurityAnalysisModel implements SecurityAnalysisModel {
   private client?: GeminiClientLike;
+  private readonly isMockClient: boolean;
 
   constructor(
     private readonly config: GeminiSecurityAnalysisModelConfig,
     client?: GeminiClientLike,
   ) {
+    this.isMockClient = Boolean(client);
     if (client) {
       this.client = client;
     }
@@ -152,31 +154,85 @@ export class GeminiSecurityAnalysisModel implements SecurityAnalysisModel {
     }
 
     const client = this.getClient();
-    let response: { text?: string | null };
+    let response: { text?: string | null } | undefined;
     const abortController = new AbortController();
     const timer = setTimeout(() => {
       abortController.abort();
     }, this.config.timeoutMs);
 
+    let lastErr: unknown;
+    const maxRetries = this.isMockClient ? 1 : 3;
+
     try {
-      response = await client.models.generateContent({
-        model: this.config.model,
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: JSON.stringify(input) }],
-          },
-        ],
-        config: {
-          systemInstruction: SECURITY_ANALYSIS_SYSTEM_PROMPT,
-          responseMimeType: "application/json",
-          responseSchema: GEMINI_ANALYSIS_SCHEMA,
-          maxOutputTokens: this.config.maxOutputTokens,
-          abortSignal: abortController.signal,
-        },
-      });
-    } catch (err) {
-      throw new AiProviderError(safeMessage(err));
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          response = await client.models.generateContent({
+            model: this.config.model,
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: JSON.stringify(input) }],
+              },
+            ],
+            config: {
+              systemInstruction: SECURITY_ANALYSIS_SYSTEM_PROMPT,
+              responseMimeType: "application/json",
+              responseSchema: GEMINI_ANALYSIS_SCHEMA,
+              maxOutputTokens: this.config.maxOutputTokens,
+              abortSignal: abortController.signal,
+            },
+          });
+          lastErr = undefined;
+          break;
+        } catch (err) {
+          lastErr = err;
+          const errMessage = typeof err === "object" && err !== null && "message" in err ? String(err.message) : "";
+          const isTransient =
+            errMessage.includes("503") ||
+            errMessage.includes("429") ||
+            errMessage.includes("overloaded") ||
+            errMessage.includes("resource has been exhausted");
+
+          if (isTransient && attempt < maxRetries) {
+            await new Promise((r) => setTimeout(r, attempt * 2000));
+            continue;
+          }
+
+          if (
+            (errMessage.includes("404") || errMessage.includes("no longer available")) &&
+            this.config.model !== "gemini-3.6-flash"
+          ) {
+            try {
+              response = await client.models.generateContent({
+                model: "gemini-3.6-flash",
+                contents: [
+                  {
+                    role: "user",
+                    parts: [{ text: JSON.stringify(input) }],
+                  },
+                ],
+                config: {
+                  systemInstruction: SECURITY_ANALYSIS_SYSTEM_PROMPT,
+                  responseMimeType: "application/json",
+                  responseSchema: GEMINI_ANALYSIS_SCHEMA,
+                  maxOutputTokens: this.config.maxOutputTokens,
+                  abortSignal: abortController.signal,
+                },
+              });
+              lastErr = undefined;
+              break;
+            } catch (fallbackErr) {
+              lastErr = fallbackErr;
+              break;
+            }
+          }
+          break;
+        }
+      }
+
+      if (lastErr || !response) {
+        throw new AiProviderError(safeMessage(lastErr));
+      }
     } finally {
       clearTimeout(timer);
     }

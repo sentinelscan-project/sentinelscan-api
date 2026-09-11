@@ -100,7 +100,7 @@ describe("Stage 8: Real Database Lifecycle Verification", () => {
         description: "Reflected XSS occurs when user input is returned without sanitization.",
         severity: "high",
         confidence: "high",
-        category: "xss",
+        category: "client-side",
         cweId: 79,
         wascId: 8,
         remediation: "Apply context-aware contextual encoding.",
@@ -122,7 +122,7 @@ describe("Stage 8: Real Database Lifecycle Verification", () => {
         description: "X-Frame-Options or Content-Security-Policy frame-ancestors is missing.",
         severity: "medium",
         confidence: "medium",
-        category: "clickjacking",
+        category: "security-header",
         cweId: 1021,
         wascId: 15,
         remediation: "Set X-Frame-Options: DENY or CSP frame-ancestors 'none'.",
@@ -168,30 +168,29 @@ describe("Stage 8: Real Database Lifecycle Verification", () => {
     // 6. Persist Security Analysis, Assessments, and Correlations
     const analysisOutput: SecurityAnalysisOutput = {
       overallRisk: "high",
-      summary: "Assessment identified reflected XSS which can lead to session hijacking.",
-      methodology: "Correlated scanner findings with threat analysis.",
+      executiveSummary: "Assessment identified reflected XSS which can lead to session hijacking.",
+      methodologySummary: "Correlated scanner findings with threat analysis.",
+      keyRisks: ["Reflected XSS combined with a missing anti-clickjacking header"],
       findingAssessments: [
         {
           findingId: xssFinding!.id,
-          aiPriority: "high",
+          priority: "high",
           riskAssessment: "Exploitation allows script execution in victim browser context.",
           confidence: "high",
           reasoning: "Payload reflects verbatim in response.",
           businessImpact: "Reputational damage and potential account compromise.",
           technicalImpact: "Arbitrary script execution, DOM access.",
-          remediationAdvice: "Implement context-sensitive output encoding.",
           remediationPriority: "high",
           falsePositiveLikelihood: "low",
         },
         {
           findingId: clickjackFinding!.id,
-          aiPriority: "medium",
+          priority: "medium",
           riskAssessment: "Site can be framed by malicious third party.",
           confidence: "high",
           reasoning: "Response lacks X-Frame-Options header.",
           businessImpact: "User deception via framing.",
           technicalImpact: "UI redressing attack.",
-          remediationAdvice: "Add Content-Security-Policy frame-ancestors directive.",
           remediationPriority: "medium",
           falsePositiveLikelihood: "low",
         },
@@ -200,11 +199,16 @@ describe("Stage 8: Real Database Lifecycle Verification", () => {
         {
           findingAId: xssFinding!.id,
           findingBId: clickjackFinding!.id,
-          relationship: "compound_risk",
+          relationship: "amplifies-risk",
           confidence: "medium",
           explanation: "Combining framing with reflected input increases susceptibility to social engineering.",
         },
       ],
+      remediationPriorities: [
+        "Implement context-sensitive output encoding for the search query parameter",
+        "Add Content-Security-Policy frame-ancestors directive",
+      ],
+      limitations: [],
     };
 
     const createdAnalysis = await prismaAnalysisRepository.create({
@@ -221,13 +225,13 @@ describe("Stage 8: Real Database Lifecycle Verification", () => {
     const completedAnalysis = await prismaAnalysisRepository.completeAnalysis(createdAnalysis.id, {
       model: "gemini-2.5-flash",
       overallRisk: analysisOutput.overallRisk,
-      executiveSummary: analysisOutput.summary,
-      methodologySummary: analysisOutput.methodology ?? null,
+      executiveSummary: analysisOutput.executiveSummary,
+      methodologySummary: analysisOutput.methodologySummary ?? null,
       limitations: null,
       completedAt: new Date(),
       assessments: analysisOutput.findingAssessments.map((a) => ({
         findingId: a.findingId,
-        priority: a.aiPriority,
+        priority: a.priority,
         riskAssessment: a.riskAssessment,
         confidence: a.confidence,
         reasoning: a.reasoning,

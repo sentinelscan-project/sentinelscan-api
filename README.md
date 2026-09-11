@@ -1217,15 +1217,40 @@ docker compose -f docker-compose.yml -f docker-compose.live-test.yml up -d --bui
 That override binds ZAP to `127.0.0.1:8090` only; it does not publish the
 daemon to a LAN interface or the public internet. Put `GEMINI_API_KEY`, the
 real/disposable `DATABASE_URL`, and an explicitly authorized public
-`LIVE_TARGET_URL` in the ignored local `.env`, then run:
+`LIVE_TARGET_URL` in the ignored local `.env`.
+
+**A plain `npm test` never makes a real external call in
+`tests/live-integration.test.ts`, even if `LIVE_TARGET_URL` and
+`GEMINI_API_KEY` are both sitting in your local `.env`.** Those secrets being
+present is necessary but never sufficient on their own — both of the file's
+real-network checks additionally require the same explicit, separate opt-in:
+`RUN_LIVE_INTEGRATION_TEST=true`.
+
+- **"3. Gemini AI Provider Live Verification"** makes one real, billed call to
+  Gemini to confirm the provider adapter works end to end. Without the opt-in
+  flag, it runs a local fail-close check instead (no network call).
+- **"4. End-to-End Pipeline Execution"** runs the full real
+  `Target → Scan → ZapScanExecutor → ZAP → Findings → Gemini →
+  SecurityAnalysis` pipeline against `LIVE_TARGET_URL`. Without the opt-in
+  flag, it is skipped entirely.
+
+This exists specifically so that having live-test secrets configured locally
+— for instance while working on the Gemini adapter, without meaning to run
+a live scan — can never cause an ordinary test run to silently make a real
+provider call or kick off a real scan against `LIVE_TARGET_URL`. To actually
+run the full live pipeline:
 
 ```bash
-ZAP_BASE_URL=http://127.0.0.1:8090 npm test -- --run tests/live-integration.test.ts
+RUN_LIVE_INTEGRATION_TEST=true ZAP_BASE_URL=http://127.0.0.1:8090 npm test -- --run tests/live-integration.test.ts
 ```
 
-The full pipeline test remains skipped unless both `GEMINI_API_KEY` and
-`LIVE_TARGET_URL` are present. It does not invent a target, bypass target
-safety, or treat a scan-only run as a full validation.
+Each real-network check remains skipped (in favor of its safe, local
+fallback) unless `RUN_LIVE_INTEGRATION_TEST=true` **and** its own required
+secret(s) (`GEMINI_API_KEY`, and for the full pipeline also `LIVE_TARGET_URL`)
+are all present — missing any one of them skips it; the flag alone, without
+real prerequisites, is never enough to trigger a real scan. It does not
+invent a target, bypass target safety, or treat a scan-only run as a full
+validation.
 
 ---
 

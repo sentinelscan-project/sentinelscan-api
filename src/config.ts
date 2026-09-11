@@ -1,7 +1,9 @@
+import path from "node:path";
 import { z } from "zod";
 import dotenv from "dotenv";
 
 dotenv.config();
+dotenv.config({ path: path.resolve(process.cwd(), "../.env") });
 
 const optionalNonEmptyString = z.preprocess(
   (val) => (typeof val === "string" && val.trim() === "" ? undefined : val),
@@ -98,7 +100,7 @@ const baseEnvSchema = z.object({
   // ---------------------------------------------------------------------
   AI_PROVIDER: z.enum(["gemini"]).default("gemini"),
   /** Which Gemini model performs security analysis. */
-  AI_MODEL: z.string().min(1).default("gemini-2.5-flash"),
+  AI_MODEL: z.string().min(1).default("gemini-3.6-flash"),
   GEMINI_API_KEY: optionalNonEmptyString,
   /** Per-analysis timeout for the AI provider call itself. */
   ANALYSIS_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),

@@ -61,13 +61,13 @@ function authedRequest(
   method: "GET" | "POST" | "PATCH" | "DELETE",
   url: string,
   cookie: string,
-  payload?: unknown,
+  payload?: Record<string, unknown>,
 ) {
   return app.inject({
     method,
     url,
     cookies: { [AUTH_COOKIE]: cookie },
-    ...(payload === undefined ? {} : { payload }),
+    payload,
   });
 }
 
@@ -197,6 +197,42 @@ describe("POST /targets/:targetId/scans — creation", () => {
 
     expect(scanExecutor.calls).toHaveLength(1);
     expect(scanExecutor.calls[0]).toMatchObject({ scanId, targetId, targetUrl: "https://staging.acme.example.com/" });
+  });
+
+  it("passes the persisted Target.url to the executor, never process.env.LIVE_TARGET_URL", async () => {
+    // LIVE_TARGET_URL is a live-integration-test-only variable (see
+    // tests/live-integration.test.ts); it is not part of the application's
+    // env schema (src/config.ts) and createScan/ZapScanExecutor never read
+    // it. Setting it here to a deliberately different, decoy value and
+    // asserting the executor still receives the target's own URL proves
+    // that production scan execution is wired to Scan → Target → Target.url
+    // and not to this environment variable.
+    const previous = process.env.LIVE_TARGET_URL;
+    process.env.LIVE_TARGET_URL = "https://decoy-should-never-be-used.example.com";
+
+    try {
+      const session = await createSession("owner-live-target-check@example.com");
+      const targetId = await createTarget(session, { url: "https://app-under-test.example.com" });
+
+      const response = await createScanViaApi(session, targetId);
+      const scanId = JSON.parse(response.payload).scan.id;
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const call = scanExecutor.calls.find((entry) => entry.scanId === scanId);
+      expect(call).toMatchObject({
+        targetId,
+        targetUrl: "https://app-under-test.example.com/",
+      });
+      expect(call?.targetUrl).not.toContain("decoy-should-never-be-used");
+      expect(call?.targetUrl).not.toBe(process.env.LIVE_TARGET_URL);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.LIVE_TARGET_URL;
+      } else {
+        process.env.LIVE_TARGET_URL = previous;
+      }
+    }
   });
 
   it("ignores a client-supplied requestedById, status, startedAt and completedAt", async () => {
@@ -641,7 +677,7 @@ describe("ScanRepository — ownership conditions at the query/repository layer"
     const result = await repo.listForOwner("user-a", { limit: 20, offset: 0 });
 
     expect(result.scans).toHaveLength(1);
-    expect(result.scans[0].requestedById).toBe("user-a");
+    expect(result.scans[0]).toMatchObject({ requestedById: "user-a" });
   });
 
   it("transitionStatus with an owner mismatch does not mutate the row", async () => {

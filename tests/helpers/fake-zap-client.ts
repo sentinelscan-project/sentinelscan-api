@@ -82,7 +82,9 @@ export class FakeZapClient implements ZapClient {
     if (this.failSpiderStatus) {
       throw new ZapRequestError("Spider status check failed");
     }
-    return this.spiderProgress.length > 1 ? (this.spiderProgress.shift() as number) : this.spiderProgress[0];
+    const next = this.spiderProgress.length > 1 ? this.spiderProgress.shift() : this.spiderProgress[0];
+    // An empty queue means "nothing left to report" — treat that as fully complete, the same as a real spider finishing.
+    return next ?? 100;
   }
 
   async stopSpider(scanId: string): Promise<void> {
@@ -103,9 +105,9 @@ export class FakeZapClient implements ZapClient {
     if (this.failActiveScanStatus) {
       throw new ZapRequestError("Active scan status check failed");
     }
-    return this.activeScanProgress.length > 1
-      ? (this.activeScanProgress.shift() as number)
-      : this.activeScanProgress[0];
+    const next = this.activeScanProgress.length > 1 ? this.activeScanProgress.shift() : this.activeScanProgress[0];
+    // An empty queue means "nothing left to report" — treat that as fully complete, the same as a real active scan finishing.
+    return next ?? 100;
   }
 
   async stopActiveScan(scanId: string): Promise<void> {

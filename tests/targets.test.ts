@@ -50,12 +50,17 @@ async function createSession(email: string): Promise<string> {
   return token;
 }
 
-function authedRequest(method: "GET" | "POST" | "PATCH" | "DELETE", url: string, cookie: string, payload?: unknown) {
+function authedRequest(
+  method: "GET" | "POST" | "PATCH" | "DELETE",
+  url: string,
+  cookie: string,
+  payload?: Record<string, unknown>,
+) {
   return app.inject({
     method,
     url,
     cookies: { [AUTH_COOKIE]: cookie },
-    ...(payload === undefined ? {} : { payload }),
+    payload,
   });
 }
 
