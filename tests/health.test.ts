@@ -72,3 +72,43 @@ describe("GET /health/zap", () => {
     await app.close();
   });
 });
+
+describe("GET /health/zap/diagnostic", () => {
+  it("requires existing authentication before the temporary secret", async () => {
+    const app = buildApp();
+    await app.ready();
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/health/zap/diagnostic",
+      headers: { "x-zap-diagnostic-secret": "temporary-test-secret" },
+    });
+
+    expect(response.statusCode).toBe(401);
+    await app.close();
+  });
+
+  it("does not expose the API key in the unauthenticated response", async () => {
+    const previous = process.env.ZAP_API_KEY;
+    process.env.ZAP_API_KEY = "must-not-appear";
+    try {
+      const app = buildApp();
+      await app.ready();
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/health/zap/diagnostic",
+        headers: { "x-zap-diagnostic-secret": "must-not-appear" },
+      });
+
+      expect(response.payload).not.toContain("must-not-appear");
+      await app.close();
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ZAP_API_KEY;
+      } else {
+        process.env.ZAP_API_KEY = previous;
+      }
+    }
+  });
+});
